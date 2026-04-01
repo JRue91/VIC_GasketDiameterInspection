@@ -1,0 +1,3 @@
+zaber-motion
+matplotlib
+telnetlib3
