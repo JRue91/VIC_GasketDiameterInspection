@@ -2,13 +2,11 @@ from __future__ import annotations
 
 """
 Zaber rotary indexing with Cognex IL38 measurement.
-Sequential: Move → Dwell → Trigger → Read
+Sequential: Move -> Dwell -> Trigger -> Read
 """
 
-import os
 import time
 import asyncio
-import contextlib
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
@@ -16,52 +14,21 @@ from dataclasses import dataclass
 from datetime import datetime
 import csv
 from pathlib import Path
-from zaber_motion.ascii import Connection
-from zaber_motion import Units, Library, DeviceDbSourceType
+from zaber_motion import Units
 
-# ======= ZABER DATABASE =======
-DB_DIR = r"C:/Zaber Devices Database"
-for db_path in [os.path.join(DB_DIR, "devices-public.sqlite")]:
-    if os.path.isfile(db_path):
-        try:
-            Library.set_device_db_source(DeviceDbSourceType.FILE, db_path)
-            break
-        except:
-            pass
+from common import (
+    telnetlib3, CognexConnection, MeasurementPoint,
+    SPEED_DEG_S, ACCEL_DEG_S2, DWELL_S,
+    open_zaber_connection, setup_zaber_axis,
+)
 
-# ======= CONFIG =======
-USE_ETHERNET = False
-PORT = "COM4"
-DEVICE_ADDRESS = 1
-AXIS_NUMBER = 1
-
+# ======= DIAMETER SCAN CONFIG =======
 INDEX_STEP_DEG = 5.0
-SPEED_DEG_S = 30.0
-ACCEL_DEG_S2 = 40.0
-DWELL_S = .01
+COGNEX_CELL = "B21"
 
 DATA_DIR = Path("../data")
 PLOTS_DIR = Path("../plots")
 MAX_RECORDS_PER_CSV = 250
-
-COGNEX_HOST = "192.168.0.150"
-COGNEX_PORT = 23
-COGNEX_USER = "admin"
-COGNEX_PASS = ""
-COGNEX_CELL = "B21"
-
-try:
-    import telnetlib3
-except:
-    telnetlib3 = None
-
-
-@dataclass
-class MeasurementPoint:
-    theta_deg: float
-    radius_inches: float
-    timestamp: float
-    attempts: int = 0
 
 
 @dataclass
@@ -72,124 +39,6 @@ class CircleFitResult:
     residual_rms: float
     max_residual: float
     r_squared: float
-
-
-class CognexConnection:
-    def __init__(self):
-        self.reader = None
-        self.writer = None
-        self._connected = False
-        
-    async def connect(self):
-        if self._connected:
-            return
-        self.reader, self.writer = await telnetlib3.open_connection(COGNEX_HOST, COGNEX_PORT, encoding='ascii')
-        print(f"[Cognex] Connected")
-        
-        await self._drain(1.0)
-        self.writer.write(f"{COGNEX_USER}\r\n")
-        await self.writer.drain()
-        await asyncio.sleep(0.05)
-        self.writer.write(f"{COGNEX_PASS}\r\n")
-        await self.writer.drain()
-        await self._drain(1.0)
-        
-        self._connected = True
-        print(f"[Cognex] Logged in")
-    
-    async def disconnect(self):
-        if self._connected and self.writer:
-            try:
-                self.writer.write("LOGOUT\r\n")
-                await self.writer.drain()
-            except:
-                pass
-            self.writer.close()
-            await self.writer.wait_closed()
-        self._connected = False
-        print("[Cognex] Disconnected")
-    
-    async def trigger(self):
-        """Send trigger and wait for acknowledgment."""
-        t_start = time.time()
-        print(f"      → Sending MT command...")
-        self.writer.write("MT\r\n")
-        await self.writer.drain()
-        t_sent = time.time()
-        print(f"      → MT sent ({(t_sent-t_start)*1000:.1f}ms)")
-        
-        print(f"      → Waiting for acknowledgment...")
-        deadline = asyncio.get_event_loop().time() + 1.0
-        
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                line = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
-                if line:
-                    txt = line.strip()
-                    print(f"      → Cognex: '{txt}'")
-                    if txt in ('1', '0', '-1') or 'OK' in txt.upper():
-                        t_ack = time.time()
-                        print(f"      → ACKNOWLEDGED ({(t_ack-t_start)*1000:.1f}ms total)")
-                        break
-            except asyncio.TimeoutError:
-                continue
-        
-        await asyncio.sleep(0.05)
-    
-    async def read_once(self):
-        """Read cell value once."""
-        t_start = time.time()
-        print(f"      → Reading {COGNEX_CELL}...")
-        
-        self.writer.write(f"GV{COGNEX_CELL}\r\n")
-        await self.writer.drain()
-        
-        timeout = asyncio.get_event_loop().time() + 1.0
-        while asyncio.get_event_loop().time() < timeout:
-            try:
-                line = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
-                if not line:
-                    continue
-                txt = line.strip()
-                if not txt or txt[0] in 'WUPLOGTS>':
-                    continue
-                
-                val = self._extract_float(txt)
-                if val is not None:
-                    t_done = time.time()
-                    print(f"      → Value: {val:.4f} inches ({(t_done-t_start)*1000:.1f}ms)")
-                    return val, 1
-            except asyncio.TimeoutError:
-                continue
-        
-        raise RuntimeError("No value received")
-    
-    async def _drain(self, timeout):
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                await asyncio.wait_for(self.reader.readline(), timeout=0.1)
-            except:
-                break
-    
-    @staticmethod
-    def _extract_float(txt):
-        buf = []
-        for ch in txt:
-            if ch.isdigit() or ch in '+-.eE':
-                buf.append(ch)
-            elif buf and '.' in ''.join(buf):
-                try:
-                    return float(''.join(buf))
-                except:
-                    pass
-                buf = []
-        if buf and '.' in ''.join(buf):
-            try:
-                return float(''.join(buf))
-            except:
-                pass
-        return None
 
 
 async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_time_plot):
@@ -211,15 +60,11 @@ async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_t
     print("  [1] At home")
     print("  [2] Verify idle")
     axis.wait_until_idle()
-    print("  [3] TRIGGER")
-    await conn.trigger()
-    print("  [4] Wait 50ms")
-    await asyncio.sleep(0.05)
-    print("  [5] READ")
-    val, attempts = await conn.read_once()
+    print("  [3] TRIGGER + READ")
+    val, read_attempts, trigger_attempts = await conn.trigger_and_read(COGNEX_CELL)
     pos = axis.get_position(Units.ANGLE_DEGREES)
-    measurements.append(MeasurementPoint(pos, val, time.time(), attempts))
-    print(f"  [6] RECORDED: {pos:.3f}° = {val:.4f} inches")
+    measurements.append(MeasurementPoint(pos, val, time.time(), read_attempts))
+    print(f"  [4] RECORDED: {pos:.3f}° = {val:.4f} inches (trigger attempts: {trigger_attempts})")
     
     if real_time_plot:
         _update_plot(measurements, ax1, ax2)
@@ -260,28 +105,35 @@ async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_t
         print(f"      is_busy after command: {axis.is_busy()}")
         
         print(f"  [2] READ previous (while moving)")
-        val, attempts = await conn.read_once()
+        try:
+            val, attempts = await conn.read_once(COGNEX_CELL)
+        except RuntimeError:
+            print(f"      ! Read failed -- will re-trigger after move settles")
+            axis.wait_until_idle()
+            time.sleep(dwell)
+            val, attempts, retrigger_attempts = await conn.trigger_and_read(COGNEX_CELL)
+            print(f"      -> Recovered after {retrigger_attempts} trigger attempt(s)")
         prev_pos = base + (i-1) * step_deg
         measurements.append(MeasurementPoint(prev_pos, val, time.time(), attempts))
         print(f"  [3] RECORDED: {prev_pos:.3f}° = {val:.4f} inches")
         print(f"      is_busy after read: {axis.is_busy()}")
-        
+
         if real_time_plot:
             _update_plot(measurements, ax1, ax2)
-        
+
         print(f"  [4] WAIT for move")
         axis.wait_until_idle()
         print(f"  [5] Move done ({time.time()-t_move:.3f}s)")
         print(f"      is_busy: {axis.is_busy()}")
-        
+
         print(f"  [6] DWELL {dwell}s")
         time.sleep(dwell)
         print(f"  [7] Dwell done")
-        
+
         print(f"  [8] Verify idle")
         axis.wait_until_idle()
         print(f"      is_busy: {axis.is_busy()}")
-        
+
         print(f"  [9] TRIGGER")
         await conn.trigger()
         print(f"  [10] Trigger done")
@@ -289,7 +141,12 @@ async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_t
     # ========== FINAL READ ==========
     print(f"\n>>> FINAL READ")
     print(f"  [1] READ final trigger")
-    val, attempts = await conn.read_once()
+    try:
+        val, attempts = await conn.read_once(COGNEX_CELL)
+    except RuntimeError:
+        print(f"      ! Read failed -- retrying with trigger + read")
+        val, attempts, retrigger_attempts = await conn.trigger_and_read(COGNEX_CELL)
+        print(f"      -> Recovered after {retrigger_attempts} trigger attempt(s)")
     final_pos = base + (num_steps - 1) * step_deg
     measurements.append(MeasurementPoint(final_pos, val, time.time(), attempts))
     print(f"  [2] RECORDED: {final_pos:.3f}° = {val:.4f} inches")
@@ -317,7 +174,7 @@ async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_t
 
 def _update_plot(measurements, ax1, ax2):
     thetas = np.array([m.theta_deg for m in measurements])
-    radii = np.array([m.radius_inches for m in measurements])
+    radii = np.array([m.value for m in measurements])
     theta_rad = np.deg2rad(thetas)
     x = radii * np.cos(theta_rad)
     y = radii * np.sin(theta_rad)
@@ -349,7 +206,7 @@ def fit_circle(measurements):
         raise ValueError("Need 3+ measurements")
 
     thetas = np.array([m.theta_deg for m in measurements])
-    radii = np.array([m.radius_inches for m in measurements])
+    radii = np.array([m.value for m in measurements])
     theta_rad = np.deg2rad(thetas)
     x = radii * np.cos(theta_rad)
     y = radii * np.sin(theta_rad)
@@ -383,7 +240,7 @@ def save_plot(measurements, fit_result, part_id):
     filename = PLOTS_DIR / f"{part_id}_circle_fit_result_{num}.png"
     
     thetas = np.array([m.theta_deg for m in measurements])
-    radii = np.array([m.radius_inches for m in measurements])
+    radii = np.array([m.value for m in measurements])
     theta_rad = np.deg2rad(thetas)
     x = radii * np.cos(theta_rad)
     y = radii * np.sin(theta_rad)
@@ -554,23 +411,15 @@ def main():
     plot_input = input("Real-time plot? (y/n) [default: n]: ").strip().lower()
     real_time = plot_input in ('y', 'yes')
     
-    conn = Connection.open_serial_port(PORT) if not USE_ETHERNET else None
-    
+    zaber_conn = open_zaber_connection()
+
     async def run_measurement():
-        with conn:
-            print(f"\n[Zaber] Connected")
-            dev = conn.get_device(DEVICE_ADDRESS)
-            dev.identify()
-            
-            axis = dev.get_axis(AXIS_NUMBER)
-            print("[Zaber] Homing...")
-            axis.home()
-            axis.wait_until_idle()
-            print("[Zaber] Ready")
-            
+        with zaber_conn:
+            axis = setup_zaber_axis(zaber_conn)
+
             cognex = CognexConnection()
             await cognex.connect()
-            
+
             try:
                 num_steps = int(num_rotations * 360.0 / step_deg)
                 measurements = await sequencer(axis, cognex, step_deg, num_steps, SPEED_DEG_S, ACCEL_DEG_S2, DWELL_S, real_time)

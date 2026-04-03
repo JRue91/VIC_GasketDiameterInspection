@@ -1,3 +1,6 @@
 zaber-motion
 matplotlib
 telnetlib3
+numpy
+scipy
+pymodbus
