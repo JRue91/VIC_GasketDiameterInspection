@@ -36,7 +36,7 @@ COGNEX_HOST = "192.168.0.150"
 COGNEX_PORT = 23
 COGNEX_USER = "admin"
 COGNEX_PASS = ""
-COGNEX_MAX_RETRIES = 2
+COGNEX_MAX_RETRIES = 5
 
 try:
     import telnetlib3

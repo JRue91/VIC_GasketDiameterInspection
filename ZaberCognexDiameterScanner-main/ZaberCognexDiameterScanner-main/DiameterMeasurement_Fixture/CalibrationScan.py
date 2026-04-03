@@ -19,7 +19,7 @@ from common import (
 )
 
 # ======= CALIBRATION CONFIG =======
-CALIBRATION_CELL = "M7"
+CALIBRATION_CELL = "F25"
 CALIBRATION_STEP_DEG = 1.0
 CALIBRATION_DIR = Path("../calibration")
 
