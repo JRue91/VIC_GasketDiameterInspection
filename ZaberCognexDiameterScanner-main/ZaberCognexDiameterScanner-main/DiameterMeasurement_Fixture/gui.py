@@ -61,51 +61,43 @@ class RedirectStream(io.TextIOBase):
 
 
 # ---------------------------------------------------------------------------
-# Settings Panel (sidebar)
+# Settings Dialog (popup)
 # ---------------------------------------------------------------------------
 
-class SettingsPanel(ttk.Frame):
-    """Sidebar panel with hardware configuration fields."""
+class SettingsManager:
+    """Manages hardware settings as StringVars and provides access/apply methods.
 
-    def __init__(self, parent):
-        super().__init__(parent)
+    The actual dialog is opened on demand via open_dialog().
+    """
+
+    DEFAULTS = {
+        "zaber_port": "COM4", "zaber_device": "1", "zaber_axis": "1",
+        "speed": "30.0", "accel": "40.0", "dwell": "0.25",
+        "cognex_host": "192.168.0.150", "cognex_port": "23",
+        "cognex_user": "admin", "cognex_pass": "",
+        "cognex_retries": "5",
+        "diameter_cell": "B21", "calibration_cell": "F25",
+    }
+
+    def __init__(self, root: tk.Tk):
+        self._root = root
         self._vars: dict[str, tk.StringVar] = {}
-        self._build()
+        # Initialise vars with current module values
+        self._vars["zaber_port"] = tk.StringVar(value=common.PORT)
+        self._vars["zaber_device"] = tk.StringVar(value=str(common.DEVICE_ADDRESS))
+        self._vars["zaber_axis"] = tk.StringVar(value=str(common.AXIS_NUMBER))
+        self._vars["speed"] = tk.StringVar(value=str(common.SPEED_DEG_S))
+        self._vars["accel"] = tk.StringVar(value=str(common.ACCEL_DEG_S2))
+        self._vars["dwell"] = tk.StringVar(value=str(common.DWELL_S))
+        self._vars["cognex_host"] = tk.StringVar(value=common.COGNEX_HOST)
+        self._vars["cognex_port"] = tk.StringVar(value=str(common.COGNEX_PORT))
+        self._vars["cognex_user"] = tk.StringVar(value=common.COGNEX_USER)
+        self._vars["cognex_pass"] = tk.StringVar(value=common.COGNEX_PASS)
+        self._vars["cognex_retries"] = tk.StringVar(value=str(common.COGNEX_MAX_RETRIES))
+        self._vars["diameter_cell"] = tk.StringVar(value="B21")
+        self._vars["calibration_cell"] = tk.StringVar(value="F25")
 
-    def _build(self):
-        # --- Zaber ---
-        zaber_lf = ttk.LabelFrame(self, text="Zaber Stage", padding=8)
-        zaber_lf.pack(fill=tk.X, padx=4, pady=(4, 2))
-
-        self._add_field(zaber_lf, "COM Port", "zaber_port", common.PORT)
-        self._add_field(zaber_lf, "Device Address", "zaber_device", str(common.DEVICE_ADDRESS))
-        self._add_field(zaber_lf, "Axis Number", "zaber_axis", str(common.AXIS_NUMBER))
-        self._add_field(zaber_lf, "Speed (deg/s)", "speed", str(common.SPEED_DEG_S))
-        self._add_field(zaber_lf, "Accel (deg/s\u00b2)", "accel", str(common.ACCEL_DEG_S2))
-        self._add_field(zaber_lf, "Dwell (s)", "dwell", str(common.DWELL_S))
-
-        # --- Cognex ---
-        cognex_lf = ttk.LabelFrame(self, text="Cognex IL38", padding=8)
-        cognex_lf.pack(fill=tk.X, padx=4, pady=(2, 2))
-
-        self._add_field(cognex_lf, "IP Address", "cognex_host", common.COGNEX_HOST)
-        self._add_field(cognex_lf, "Port", "cognex_port", str(common.COGNEX_PORT))
-        self._add_field(cognex_lf, "Username", "cognex_user", common.COGNEX_USER)
-        self._add_field(cognex_lf, "Password", "cognex_pass", common.COGNEX_PASS)
-        self._add_field(cognex_lf, "Max Retries", "cognex_retries", str(common.COGNEX_MAX_RETRIES))
-
-        # --- Restore defaults ---
-        ttk.Button(self, text="Restore Defaults", command=self._restore_defaults).pack(
-            pady=(6, 4), padx=4, fill=tk.X
-        )
-
-    def _add_field(self, parent, label_text, key, default):
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=1)
-        ttk.Label(row, text=label_text, width=16, anchor=tk.W).pack(side=tk.LEFT)
-        var = tk.StringVar(value=default)
-        ttk.Entry(row, textvariable=var, width=14).pack(side=tk.RIGHT, fill=tk.X, expand=True)
-        self._vars[key] = var
+    # -- Public helpers (used by tabs / scan threads) --
 
     def get(self, key: str) -> str:
         return self._vars[key].get()
@@ -126,17 +118,80 @@ class SettingsPanel(ttk.Frame):
         common.COGNEX_USER = self.get("cognex_user")
         common.COGNEX_PASS = self.get("cognex_pass")
         common.COGNEX_MAX_RETRIES = self.get_int("cognex_retries")
+        DiameterScan.COGNEX_CELL = self.get("diameter_cell")
+        CalibrationScan.CALIBRATION_CELL = self.get("calibration_cell")
 
-    def _restore_defaults(self):
-        defaults = {
-            "zaber_port": "COM4", "zaber_device": "1", "zaber_axis": "1",
-            "speed": "30.0", "accel": "40.0", "dwell": "0.25",
-            "cognex_host": "192.168.0.150", "cognex_port": "23",
-            "cognex_user": "admin", "cognex_pass": "",
-            "cognex_retries": "5",
-        }
-        for key, val in defaults.items():
+    def restore_defaults(self):
+        for key, val in self.DEFAULTS.items():
             self._vars[key].set(val)
+
+    # -- Dialog --
+
+    def open_dialog(self):
+        """Open a modal settings dialog."""
+        dlg = tk.Toplevel(self._root)
+        dlg.title("Settings")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self._root)
+
+        notebook = ttk.Notebook(dlg)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
+
+        # --- Zaber tab ---
+        zaber_frame = ttk.Frame(notebook, padding=12)
+        notebook.add(zaber_frame, text="Zaber Stage")
+
+        self._dialog_field(zaber_frame, "COM Port", "zaber_port", 0)
+        self._dialog_field(zaber_frame, "Device Address", "zaber_device", 1)
+        self._dialog_field(zaber_frame, "Axis Number", "zaber_axis", 2)
+        self._dialog_field(zaber_frame, "Speed (deg/s)", "speed", 3)
+        self._dialog_field(zaber_frame, "Accel (deg/s\u00b2)", "accel", 4)
+        self._dialog_field(zaber_frame, "Dwell (s)", "dwell", 5)
+
+        # --- Cognex tab ---
+        cognex_frame = ttk.Frame(notebook, padding=12)
+        notebook.add(cognex_frame, text="Cognex IL38")
+
+        self._dialog_field(cognex_frame, "IP Address", "cognex_host", 0)
+        self._dialog_field(cognex_frame, "Port", "cognex_port", 1)
+        self._dialog_field(cognex_frame, "Username", "cognex_user", 2)
+        self._dialog_field(cognex_frame, "Password", "cognex_pass", 3)
+        self._dialog_field(cognex_frame, "Max Retries", "cognex_retries", 4)
+
+        ttk.Separator(cognex_frame, orient=tk.HORIZONTAL).grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=6,
+        )
+        ttk.Label(cognex_frame, text="Cell Addresses", font=("Segoe UI", 8, "italic")).grid(
+            row=6, column=0, columnspan=2, sticky=tk.W,
+        )
+        self._dialog_field(cognex_frame, "Diameter Cell", "diameter_cell", 7)
+        self._dialog_field(cognex_frame, "Calibration Cell", "calibration_cell", 8)
+
+        # --- Buttons ---
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(btn_frame, text="Restore Defaults", command=self.restore_defaults).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        # Centre on parent
+        dlg.update_idletasks()
+        pw = self._root.winfo_width()
+        ph = self._root.winfo_height()
+        px = self._root.winfo_x()
+        py = self._root.winfo_y()
+        dw = dlg.winfo_width()
+        dh = dlg.winfo_height()
+        dlg.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+    def _dialog_field(self, parent, label_text, key, row):
+        ttk.Label(parent, text=label_text, anchor=tk.W).grid(
+            row=row, column=0, sticky=tk.W, padx=(0, 8), pady=2,
+        )
+        ttk.Entry(parent, textvariable=self._vars[key], width=20).grid(
+            row=row, column=1, sticky=tk.EW, pady=2,
+        )
+        parent.columnconfigure(1, weight=1)
 
 
 # ---------------------------------------------------------------------------
@@ -258,14 +313,12 @@ class DiameterScanTab(ttk.Frame):
         form.pack(fill=tk.X, padx=8, pady=8)
 
         self.part_id_var = tk.StringVar()
-        self.step_var = tk.StringVar(value="5.0")
+        self.step_var = tk.StringVar(value="5")
         self.rotations_var = tk.StringVar(value="1")
-        self.cell_var = tk.StringVar(value="B21")
 
         self._add_field(form, "Part ID *", self.part_id_var)
         self._add_field(form, "Step Size (deg)", self.step_var)
         self._add_field(form, "Rotations", self.rotations_var)
-        self._add_field(form, "Cognex Cell", self.cell_var)
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=8)
@@ -286,17 +339,12 @@ class DiameterScanTab(ttk.Frame):
             messagebox.showerror("Validation", "Part ID is required.")
             return
         try:
-            step_deg = float(self.step_var.get())
+            step_deg = int(self.step_var.get())
             num_rotations = int(self.rotations_var.get())
             if step_deg <= 0 or num_rotations <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Validation", "Step size and rotations must be positive numbers.")
-            return
-
-        cell = self.cell_var.get().strip()
-        if not cell:
-            messagebox.showerror("Validation", "Cognex Cell is required.")
+            messagebox.showerror("Validation", "Step size and rotations must be positive whole numbers.")
             return
 
         speed = self.app.settings.get_float("speed")
@@ -306,12 +354,12 @@ class DiameterScanTab(ttk.Frame):
         self.app.start_scan(
             "Diameter Scan",
             self._run_thread,
-            (part_id, step_deg, num_rotations, cell, speed, accel, dwell),
+            (part_id, step_deg, num_rotations, speed, accel, dwell),
         )
 
-    def _run_thread(self, part_id, step_deg, num_rotations, cell, speed, accel, dwell):
+    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell):
         self.app.settings.apply_to_modules()
-        DiameterScan.COGNEX_CELL = cell
+        stop_event = self.app._stop_event
 
         zaber_conn = open_zaber_connection()
 
@@ -323,7 +371,8 @@ class DiameterScanTab(ttk.Frame):
                 try:
                     num_steps = int(num_rotations * 360.0 / step_deg)
                     return await sequencer(axis, cognex, step_deg, num_steps,
-                                           speed, accel, dwell, False)
+                                           speed, accel, dwell, False,
+                                           stop_event=stop_event)
                 finally:
                     await cognex.disconnect()
 
@@ -361,12 +410,10 @@ class CalibrationScanTab(ttk.Frame):
         form.pack(fill=tk.X, padx=8, pady=8)
 
         self.cal_id_var = tk.StringVar()
-        self.step_var = tk.StringVar(value="1.0")
-        self.cell_var = tk.StringVar(value="F25")
+        self.step_var = tk.StringVar(value="1")
 
         self._add_field(form, "Calibration ID *", self.cal_id_var)
         self._add_field(form, "Step Size (deg)", self.step_var)
-        self._add_field(form, "Cognex Cell", self.cell_var)
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=8)
@@ -387,16 +434,11 @@ class CalibrationScanTab(ttk.Frame):
             messagebox.showerror("Validation", "Calibration ID is required.")
             return
         try:
-            step_deg = float(self.step_var.get())
+            step_deg = int(self.step_var.get())
             if step_deg <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Validation", "Step size must be a positive number.")
-            return
-
-        cell = self.cell_var.get().strip()
-        if not cell:
-            messagebox.showerror("Validation", "Cognex Cell is required.")
+            messagebox.showerror("Validation", "Step size must be a positive whole number.")
             return
 
         speed = self.app.settings.get_float("speed")
@@ -406,12 +448,12 @@ class CalibrationScanTab(ttk.Frame):
         self.app.start_scan(
             "Calibration Scan",
             self._run_thread,
-            (cal_id, step_deg, cell, speed, accel, dwell),
+            (cal_id, step_deg, speed, accel, dwell),
         )
 
-    def _run_thread(self, cal_id, step_deg, cell, speed, accel, dwell):
+    def _run_thread(self, cal_id, step_deg, speed, accel, dwell):
         self.app.settings.apply_to_modules()
-        CalibrationScan.CALIBRATION_CELL = cell
+        stop_event = self.app._stop_event
 
         zaber_conn = open_zaber_connection()
 
@@ -422,7 +464,8 @@ class CalibrationScanTab(ttk.Frame):
                 await cognex.connect()
                 try:
                     return await calibration_scan(axis, cognex, step_deg,
-                                                  speed, accel, dwell)
+                                                  speed, accel, dwell,
+                                                  stop_event=stop_event)
                 finally:
                     await cognex.disconnect()
 
@@ -432,7 +475,7 @@ class CalibrationScanTab(ttk.Frame):
             self.app._result_queue.put(("error", "No measurements collected."))
             return
 
-        save_calibration(measurements, cal_id)
+        save_calibration(measurements, cal_id, step_deg)
 
         values = [m.value for m in measurements]
         print(f"\nCalibration Summary: {len(measurements)} points, "
@@ -466,8 +509,12 @@ class CalibrationVerifyTab(ttk.Frame):
         self.file_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         ttk.Button(file_row, text="Refresh", command=self._refresh_files).pack(side=tk.RIGHT)
 
-        self.step_var = tk.StringVar(value="1.0")
-        self._add_field(form, "Step Size (deg)", self.step_var)
+        # Step size display (read-only, loaded from calibration file)
+        step_row = ttk.Frame(form)
+        step_row.pack(fill=tk.X, pady=2)
+        ttk.Label(step_row, text="Step Size (deg)", width=18, anchor=tk.W).pack(side=tk.LEFT)
+        self._step_label = ttk.Label(step_row, text="--", anchor=tk.W)
+        self._step_label.pack(side=tk.LEFT)
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=8)
@@ -479,12 +526,6 @@ class CalibrationVerifyTab(ttk.Frame):
         # Populate file list
         self._refresh_files()
         self.file_combo.bind("<<ComboboxSelected>>", self._on_file_selected)
-
-    def _add_field(self, parent, label, var):
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text=label, width=18, anchor=tk.W).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=var).pack(side=tk.RIGHT, fill=tk.X, expand=True)
 
     def _refresh_files(self):
         self._cal_files = find_calibration_files()
@@ -498,22 +539,13 @@ class CalibrationVerifyTab(ttk.Frame):
         idx = self.file_combo.current()
         if idx < 0 or idx >= len(self._cal_files):
             return
-        cal_data = load_calibration(self._cal_files[idx])
-        if len(cal_data) >= 2:
-            step = abs(cal_data[1][0] - cal_data[0][0])
-            self.step_var.set(str(step))
+        step_deg, _data = load_calibration(self._cal_files[idx])
+        self._step_label.configure(text=str(step_deg) if step_deg else "--")
 
     def _start(self):
         idx = self.file_combo.current()
         if idx < 0 or idx >= len(self._cal_files):
             messagebox.showerror("Validation", "Select a calibration file.")
-            return
-        try:
-            step_deg = float(self.step_var.get())
-            if step_deg <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Validation", "Step size must be a positive number.")
             return
 
         cal_file = self._cal_files[idx]
@@ -524,14 +556,15 @@ class CalibrationVerifyTab(ttk.Frame):
         self.app.start_scan(
             "Calibration Verify",
             self._run_thread,
-            (cal_file, step_deg, speed, accel, dwell),
+            (cal_file, speed, accel, dwell),
         )
 
-    def _run_thread(self, cal_file, step_deg, speed, accel, dwell):
+    def _run_thread(self, cal_file, speed, accel, dwell):
         self.app.settings.apply_to_modules()
+        stop_event = self.app._stop_event
 
-        cal_data = load_calibration(cal_file)
-        print(f"Loaded {len(cal_data)} calibration points from {cal_file.name}")
+        step_deg, cal_data = load_calibration(cal_file)
+        print(f"Loaded {len(cal_data)} calibration points from {cal_file.name} (step={step_deg} deg)")
 
         zaber_conn = open_zaber_connection()
 
@@ -542,7 +575,8 @@ class CalibrationVerifyTab(ttk.Frame):
                 await cognex.connect()
                 try:
                     return await calibration_scan(axis, cognex, step_deg,
-                                                  speed, accel, dwell)
+                                                  speed, accel, dwell,
+                                                  stop_event=stop_event)
                 finally:
                     await cognex.disconnect()
 
@@ -576,8 +610,8 @@ class GasketInspectorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Gasket Diameter Inspection System")
-        self.root.geometry("1200x800")
-        self.root.minsize(900, 600)
+        self.root.geometry("1100x800")
+        self.root.minsize(800, 600)
 
         self._log_queue: queue.Queue = queue.Queue()
         self._result_queue: queue.Queue = queue.Queue()
@@ -586,34 +620,54 @@ class GasketInspectorApp:
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
 
+        # Settings manager (no UI widget -- opens a dialog on demand)
+        self.settings = SettingsManager(self.root)
+
         # Redirect stdout/stderr
         sys.stdout = RedirectStream(self._log_queue)
         sys.stderr = RedirectStream(self._log_queue, tag="ERROR")
 
+        self._build_menu()
         self._build_ui()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         self._poll_results()
 
+    # -- Menu bar --
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+
+        # File
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Exit", command=self._on_closing)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        # Edit
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label="Settings...", command=self.settings.open_dialog)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        # Help
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+        self.root.config(menu=menubar)
+
+    def _show_about(self):
+        messagebox.showinfo(
+            "About",
+            "Gasket Diameter Inspection System\n\n"
+            "Zaber rotary stage + Cognex IL38 sensor\n"
+            "Diameter measurement, calibration, and verification.",
+        )
+
+    # -- Main content --
+
     def _build_ui(self):
-        # Top-level horizontal pane: sidebar | main
-        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True)
-
-        # --- Sidebar ---
-        sidebar = ttk.Frame(main_pane, width=260)
-        self.settings = SettingsPanel(sidebar)
-        self.settings.pack(fill=tk.X)
-        self.status_bar = StatusBar(sidebar)
-        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
-        main_pane.add(sidebar, weight=0)
-
-        # --- Main content ---
-        content = ttk.Frame(main_pane)
-        main_pane.add(content, weight=1)
-
         # Notebook (tabs)
-        self.notebook = ttk.Notebook(content)
+        self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.X, padx=4, pady=4)
 
         self.diameter_tab = DiameterScanTab(self.notebook, self)
@@ -625,7 +679,7 @@ class GasketInspectorApp:
         self.notebook.add(self.verify_tab, text="Calibration Verify")
 
         # Vertical pane: plot | log
-        v_pane = ttk.PanedWindow(content, orient=tk.VERTICAL)
+        v_pane = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
         v_pane.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
         self.plot_panel = PlotPanel(v_pane)
@@ -633,6 +687,10 @@ class GasketInspectorApp:
 
         self.log_panel = LogPanel(v_pane, self._log_queue)
         v_pane.add(self.log_panel, weight=1)
+
+        # Status bar at bottom
+        self.status_bar = StatusBar(self.root)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
     # -- Scan lifecycle --
 

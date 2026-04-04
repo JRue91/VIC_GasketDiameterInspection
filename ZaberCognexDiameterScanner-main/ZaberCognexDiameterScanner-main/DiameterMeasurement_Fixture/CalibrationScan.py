@@ -24,7 +24,7 @@ CALIBRATION_STEP_DEG = 1.0
 CALIBRATION_DIR = Path("../calibration")
 
 
-async def calibration_scan(axis, cognex, step_deg, speed, accel, dwell):
+async def calibration_scan(axis, cognex, step_deg, speed, accel, dwell, stop_event=None):
     """Scan 0-359 degrees at step_deg increments, reading CALIBRATION_CELL at each position."""
     num_steps = int(360.0 / step_deg)
     measurements = []
@@ -36,6 +36,10 @@ async def calibration_scan(axis, cognex, step_deg, speed, accel, dwell):
     print("=" * 70)
 
     for i in range(num_steps):
+        if stop_event and stop_event.is_set():
+            print("\n[STOPPED] Scan cancelled by user.")
+            break
+
         target = base + i * step_deg
         print(f"\n>>> POSITION {i}: {target:.3f} deg")
 
@@ -68,13 +72,14 @@ async def calibration_scan(axis, cognex, step_deg, speed, accel, dwell):
     return measurements
 
 
-def save_calibration(measurements, cal_id):
-    """Save calibration data to CSV."""
+def save_calibration(measurements, cal_id, step_deg):
+    """Save calibration data to CSV with step size in the header."""
     CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
     filename = CALIBRATION_DIR / f"calibration_{cal_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
     with open(filename, 'w', newline='') as f:
         writer = csv.writer(f)
+        writer.writerow(['StepSize', str(step_deg)])
         writer.writerow(['Degree', 'Value', 'Timestamp'])
         for m in measurements:
             writer.writerow([f"{m.theta_deg:.3f}", f"{m.value:.6f}", f"{m.timestamp:.3f}"])
@@ -84,13 +89,24 @@ def save_calibration(measurements, cal_id):
 
 
 def load_calibration(filepath):
-    """Load calibration data from CSV. Returns list of (degree, value) tuples."""
+    """Load calibration data from CSV. Returns (step_deg, data) where data is list of (degree, value) tuples."""
     data = []
+    step_deg = None
     with open(filepath) as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
         for row in reader:
-            data.append((float(row['Degree']), float(row['Value'])))
-    return data
+            if not row:
+                continue
+            if row[0] == 'StepSize':
+                step_deg = int(row[1])
+                continue
+            if row[0] == 'Degree':
+                continue
+            data.append((float(row[0]), float(row[1])))
+    # Fallback for older files without StepSize header
+    if step_deg is None and len(data) >= 2:
+        step_deg = int(round(abs(data[1][0] - data[0][0])))
+    return step_deg, data
 
 
 def main():
@@ -138,7 +154,7 @@ def main():
         print("\nERROR: No measurements collected")
         return
 
-    cal_file = save_calibration(measurements, cal_id)
+    cal_file = save_calibration(measurements, cal_id, step_deg)
 
     # Print summary
     values = [m.value for m in measurements]

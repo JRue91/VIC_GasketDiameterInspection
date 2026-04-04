@@ -41,7 +41,7 @@ class CircleFitResult:
     r_squared: float
 
 
-async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_time_plot):
+async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_time_plot, stop_event=None):
     """BRUTE FORCE SEQUENCER."""
     measurements = []
     base = axis.get_position(Units.ANGLE_DEGREES)
@@ -70,6 +70,10 @@ async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_t
         _update_plot(measurements, ax1, ax2)
     
     # ========== POSITION 1 ==========
+    if stop_event and stop_event.is_set():
+        print("\n[STOPPED] Scan cancelled by user.")
+        return measurements
+
     target_1 = base + step_deg
     print(f"\n>>> POSITION 1: {target_1:.3f}°")
     print(f"  [1] MOVE (BLOCKING)")
@@ -92,6 +96,10 @@ async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_t
     
     # ========== POSITIONS 2 TO N-1 ==========
     for i in range(2, num_steps):
+        if stop_event and stop_event.is_set():
+            print("\n[STOPPED] Scan cancelled by user.")
+            return measurements
+
         target = base + i * step_deg
         print(f"\n>>> POSITION {i}: {target:.3f}°")
         

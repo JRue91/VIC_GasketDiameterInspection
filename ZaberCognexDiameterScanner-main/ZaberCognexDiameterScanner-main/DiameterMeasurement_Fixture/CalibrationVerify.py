@@ -182,17 +182,9 @@ def main():
             break
         print("Invalid selection.")
 
-    cal_data = load_calibration(cal_file)
+    step_deg, cal_data = load_calibration(cal_file)
     print(f"\nLoaded {len(cal_data)} calibration points from {cal_file.name}")
-
-    # Determine step size from calibration data
-    if len(cal_data) >= 2:
-        cal_step = abs(cal_data[1][0] - cal_data[0][0])
-    else:
-        cal_step = CALIBRATION_STEP_DEG
-
-    step_input = input(f"Step size [default: {cal_step} to match calibration]: ").strip()
-    step_deg = float(step_input) if step_input else cal_step
+    print(f"Step size from calibration file: {step_deg} deg")
 
     num_steps = int(360.0 / step_deg)
     print(f"\nThis will take {num_steps} measurements at {step_deg} deg increments.")
