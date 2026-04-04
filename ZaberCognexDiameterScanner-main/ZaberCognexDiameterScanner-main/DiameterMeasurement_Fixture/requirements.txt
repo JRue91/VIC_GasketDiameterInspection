@@ -4,3 +4,4 @@ telnetlib3
 numpy
 scipy
 pymodbus
+Pillow
