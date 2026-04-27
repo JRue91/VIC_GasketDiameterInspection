@@ -1,2 +1,4 @@
 *.dwl
 *.dwl2
+__pycache__/
+.vscode/
