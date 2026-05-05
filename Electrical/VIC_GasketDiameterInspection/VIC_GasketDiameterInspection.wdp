@@ -1,6 +1,6 @@
-﻿+[1]%SL_DIR%jic125/;%SL_DIR%jic125/1-/;%SL_DIR%pneu_iso125/;%SL_DIR%hyd_iso125/;%SL_DIR%pid/
+﻿+[1]jic125/;jic125/1-/;pneu_iso125/;hyd_iso125/;pid/
 +[2]ACE_JIC_MENU.DAT
-+[3]%SL_DIR%panel/
++[3]panel/
 +[4]ACE_PANEL_MENU.DAT
 +[5]1
 +[6]0
@@ -111,11 +111,19 @@
 ?[74]0.0
 ?[75]1
 ?[76]0.000000,0.031250,0.000000
-===Panel Drawing
-===
-===
-C01_Panel Drawing.dwg
 ===Electrical Distribution
 ===
 ===
 A01_Electrical Distribution.dwg
+===Electrical Distribution 2
+===
+===
+A02_Electrical Distribution 2.dwg
+===Panel Drawing
+===
+===
+C01_Panel Drawing.dwg
+===Electrical Bill Of Materials
+===
+===
+B02_Electrical BOM.dwg
