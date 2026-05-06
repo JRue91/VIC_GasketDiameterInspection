@@ -27,7 +27,11 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 import common
 from common import CognexConnection, open_zaber_connection, setup_zaber_axis
 import DiameterScan
-from DiameterScan import sequencer, fit_circle, save_plot, save_csv, print_results
+from DiameterScan import (
+    sequencer, fit_circle, save_plot, save_csv, print_results,
+    apply_calibration, save_combined_report,
+    split_into_rotations, save_multi_rotation_report,
+)
 import CalibrationScan
 from CalibrationScan import calibration_scan, save_calibration, load_calibration
 import CalibrationVerify
@@ -321,12 +325,49 @@ class DiameterScanTab(ttk.Frame):
         self._add_field(form, "Step Size (deg)", self.step_var)
         self._add_field(form, "Rotations", self.rotations_var)
 
+        # Calibration controls
+        self.apply_cal_var = tk.BooleanVar(value=False)
+        cal_check_row = ttk.Frame(form)
+        cal_check_row.pack(fill=tk.X, pady=(8, 2))
+        ttk.Checkbutton(
+            cal_check_row, text="Apply Calibration",
+            variable=self.apply_cal_var, command=self._on_apply_cal_toggled,
+        ).pack(side=tk.LEFT)
+
+        cal_file_row = ttk.Frame(form)
+        cal_file_row.pack(fill=tk.X, pady=2)
+        ttk.Label(cal_file_row, text="Calibration File", width=18, anchor=tk.W).pack(side=tk.LEFT)
+        self.cal_file_var = tk.StringVar()
+        self.cal_file_combo = ttk.Combobox(
+            cal_file_row, textvariable=self.cal_file_var, state="disabled",
+        )
+        self.cal_file_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.cal_refresh_btn = ttk.Button(
+            cal_file_row, text="Refresh", command=self._refresh_cal_files, state=tk.DISABLED,
+        )
+        self.cal_refresh_btn.pack(side=tk.RIGHT)
+        self._cal_files = []
+        self._refresh_cal_files()
+
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=8)
         self.start_btn = ttk.Button(btn_frame, text="Start Scan", command=self._start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.app.request_stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
+
+    def _on_apply_cal_toggled(self):
+        enabled = self.apply_cal_var.get()
+        state = "readonly" if enabled else "disabled"
+        self.cal_file_combo.configure(state=state)
+        self.cal_refresh_btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _refresh_cal_files(self):
+        self._cal_files = find_calibration_files()
+        names = [f.name for f in self._cal_files]
+        self.cal_file_combo["values"] = names
+        if names:
+            self.cal_file_combo.current(len(names) - 1)
 
     def _add_field(self, parent, label, var):
         row = ttk.Frame(parent)
@@ -348,6 +389,14 @@ class DiameterScanTab(ttk.Frame):
             messagebox.showerror("Validation", "Step size and rotations must be positive whole numbers.")
             return
 
+        cal_file = None
+        if self.apply_cal_var.get():
+            idx = self.cal_file_combo.current()
+            if idx < 0 or idx >= len(self._cal_files):
+                messagebox.showerror("Validation", "Select a calibration file.")
+                return
+            cal_file = self._cal_files[idx]
+
         speed = self.app.settings.get_float("speed")
         accel = self.app.settings.get_float("accel")
         dwell = self.app.settings.get_float("dwell")
@@ -355,12 +404,17 @@ class DiameterScanTab(ttk.Frame):
         self.app.start_scan(
             "Diameter Scan",
             self._run_thread,
-            (part_id, step_deg, num_rotations, speed, accel, dwell),
+            (part_id, step_deg, num_rotations, speed, accel, dwell, cal_file),
         )
 
-    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell):
+    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell, cal_file):
         self.app.settings.apply_to_modules()
         stop_event = self.app._stop_event
+
+        cal_data = None
+        if cal_file is not None:
+            _step, cal_data = load_calibration(cal_file)
+            print(f"[Calibration] Loaded {len(cal_data)} points from {cal_file.name}")
 
         zaber_conn = open_zaber_connection()
 
@@ -370,28 +424,78 @@ class DiameterScanTab(ttk.Frame):
                 cognex = CognexConnection()
                 await cognex.connect()
                 try:
+                    b19_value = None
+                    if cal_data is not None:
+                        b19_value = await cognex.read_cell("B19")
+                        print(f"[Calibration] Live B19 = {b19_value:.4f}")
                     num_steps = int(num_rotations * 360.0 / step_deg)
-                    return await sequencer(axis, cognex, step_deg, num_steps,
-                                           speed, accel, dwell, False,
-                                           stop_event=stop_event)
+                    measurements = await sequencer(axis, cognex, step_deg, num_steps,
+                                                   speed, accel, dwell, False,
+                                                   stop_event=stop_event)
+                    return measurements, b19_value
                 finally:
                     await cognex.disconnect()
 
-        measurements = asyncio.run(run())
+        measurements, b19 = asyncio.run(run())
 
         if len(measurements) < 3:
             self.app._result_queue.put(("error", "Not enough measurements collected."))
             return
 
+        # Apply calibration first if requested (operates on the full flat list)
+        if cal_data is not None:
+            cal_meas, f25_nominal = apply_calibration(measurements, cal_data)
+        else:
+            cal_meas, f25_nominal = None, None
+
+        # ---- Multi-rotation comparison branch ----
+        if num_rotations > 1:
+            base_measurements = cal_meas if cal_data is not None else measurements
+            rotations = split_into_rotations(base_measurements, step_deg, num_rotations)
+            if len(rotations) < 2 or any(len(r) < 3 for r in rotations):
+                self.app._result_queue.put((
+                    "error",
+                    "Not enough complete rotations to compare.",
+                ))
+                return
+            fits = [fit_circle(rot) for rot in rotations]
+            for i, (rot, fit) in enumerate(zip(rotations, fits), start=1):
+                tag = f"{part_id} - rotation {i}"
+                if cal_data is not None:
+                    tag += " (calibrated)"
+                print_results(tag, rot, fit)
+
+            _csv_path, png_path = save_multi_rotation_report(
+                part_id, rotations, fits,
+                b19=b19 if cal_data is not None else None,
+                f25_nominal=f25_nominal,
+                cal_file_name=cal_file.name if cal_file is not None else None,
+            )
+            self.app._result_queue.put(("complete", {"plot_path": png_path}))
+            return
+
+        # ---- Single-rotation branches ----
         fit = fit_circle(measurements)
-        save_csv(part_id, measurements, fit)
-        print_results(part_id, measurements, fit)
-        save_plot(measurements, fit, part_id)
 
-        plot_files = sorted(DiameterScan.PLOTS_DIR.glob(f"{part_id}_circle_fit_result_*.png"))
-        plot_path = plot_files[-1] if plot_files else None
+        if cal_data is None:
+            save_csv(part_id, measurements, fit)
+            print_results(part_id, measurements, fit)
+            save_plot(measurements, fit, part_id)
+            plot_files = sorted(DiameterScan.PLOTS_DIR.glob(f"{part_id}_circle_fit_result_*.png"))
+            plot_path = plot_files[-1] if plot_files else None
+            self.app._result_queue.put(("complete", {"plot_path": plot_path}))
+            return
 
-        self.app._result_queue.put(("complete", {"plot_path": plot_path}))
+        cal_fit = fit_circle(cal_meas)
+        print_results(f"{part_id} (raw)", measurements, fit)
+        print_results(f"{part_id} (calibrated)", cal_meas, cal_fit)
+
+        _csv_path, png_path = save_combined_report(
+            part_id, measurements, fit, cal_meas, cal_fit,
+            b19, f25_nominal, cal_data, cal_file.name,
+        )
+
+        self.app._result_queue.put(("complete", {"plot_path": png_path}))
 
 
 # ---------------------------------------------------------------------------

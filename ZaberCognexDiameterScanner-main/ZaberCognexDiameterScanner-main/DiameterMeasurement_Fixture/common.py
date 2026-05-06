@@ -144,6 +144,11 @@ class CognexConnection:
 
         raise RuntimeError("No value received")
 
+    async def read_cell(self, cell):
+        """Read a stored cell value (no MT trigger). Returns float."""
+        val, _ = await self.read_once(cell)
+        return val
+
     async def trigger_and_read(self, cell):
         """Trigger and read with retries on failure."""
         for attempt in range(1, COGNEX_MAX_RETRIES + 1):

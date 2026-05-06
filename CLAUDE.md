@@ -40,8 +40,11 @@ Individual modules can also be run directly from the same folder for CLI use
   database expected at `C:/Zaber Devices Database/devices-public.sqlite`
   (loaded in `common.py` if present; otherwise zaber-motion fetches online).
 - **Cognex IL38**: telnet (default 192.168.0.150:23, user `admin`, blank
-  password). Cells: `B21` for diameter scans, `F25` for calibration. `MT`
-  triggers a measurement; `GV<cell>` reads the value.
+  password). Cells: `B21` for diameter scans (radius reading from rotation
+  axis, doubled by `fit_circle()` to report diameter), `F25` for calibration
+  (scanner-to-surface distance), `B19` for the calibrated diameter (read
+  live as metadata when applying calibration). `MT` triggers a measurement;
+  `GV<cell>` reads the value (no trigger needed for stored cells like B19).
 
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
@@ -52,7 +55,21 @@ before each scan starts.
 All output files are timestamped (`YYYYMMDD_HHMMSS`) so re-runs never overwrite
 prior results:
 
-- Diameter scan: `<part_id>_<timestamp>.csv` and `<part_id>_circle_fit_result_<timestamp>.png`
+- Diameter scan (raw, 1 rotation): `<part_id>_<timestamp>.csv` and `<part_id>_circle_fit_result_<timestamp>.png`
+- Diameter scan (with **Apply Calibration** checked, 1 rotation): `<part_id>_combined_<timestamp>.{csv,png}`
+  — single combined report with raw + calibrated circle fits side-by-side, the
+  per-angle offset curve, and a stats table. Offset applied per measurement is
+  `corrected_B21(θ) = raw_B21(θ) + (F25_cal(θ) − mean(F25_cal))`. B19 is read
+  live and recorded as metadata.
+- Diameter scan (Rotations > 1): `<part_id>_multirotation_<timestamp>.{csv,png}`
+  — each rotation is treated as an independent dataset. The flat scan is split
+  into N chunks of `360/step_deg` measurements, theta normalized to [0, 360),
+  and each rotation gets its own circle fit. The report shows all rotations
+  overlaid (cartesian + polar), per-angle deviation from the cross-rotation
+  mean, and a stats table including diameter range / stdev across rotations.
+  When **Apply Calibration** is also checked, calibration is applied to the
+  full flat list before splitting, so the comparison is between calibrated
+  rotations.
 - Calibration scan: `calibration_<cal_id>_<timestamp>.csv` (header carries `StepSize`)
 - Calibration verify: `verify_report_<cal_id>_<N>runs_<timestamp>.{png,csv}`
 

@@ -382,6 +382,360 @@ def save_csv(part_id, measurements, fit_result):
     print(f"[Data] Appended to: {csv_file}")
 
 
+def apply_calibration(measurements, cal_data):
+    """Return (calibrated_measurements, f25_nominal).
+
+    B21 and F25 are both radius-from-scanner readings in the same units, so
+    the chuck-runout offset is +(F25(theta) - mean(F25)) per radius reading.
+    The fit_circle() output diameter (= 2 * mean radius) reflects the full
+    diameter correction implicitly. Degree matching mirrors
+    CalibrationVerify.compare(): round to 0.1 deg, nearest fallback.
+    """
+    cal_dict = {round(d % 360, 1): v for d, v in cal_data}
+    cal_degs = np.array(sorted(cal_dict.keys()))
+    f25_nominal = float(np.mean(list(cal_dict.values())))
+
+    out = []
+    for m in measurements:
+        rounded = round(m.theta_deg % 360, 1)
+        f25 = cal_dict.get(rounded)
+        if f25 is None:
+            nearest = cal_degs[np.argmin(np.abs(cal_degs - rounded))]
+            f25 = cal_dict[float(nearest)]
+        offset = f25 - f25_nominal
+        out.append(MeasurementPoint(m.theta_deg, m.value + offset, m.timestamp, m.attempts))
+    return out, f25_nominal
+
+
+def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
+                          b19, f25_nominal, cal_data, cal_file_name):
+    """Write a combined CSV + PNG report comparing raw and calibrated runs.
+
+    Returns (csv_path, png_path).
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    cal_dict = {round(d % 360, 1): v for d, v in cal_data}
+    cal_degs_sorted = np.array(sorted(cal_dict.keys()))
+
+    def lookup_f25(theta_deg):
+        rounded = round(theta_deg % 360, 1)
+        v = cal_dict.get(rounded)
+        if v is None:
+            nearest = cal_degs_sorted[np.argmin(np.abs(cal_degs_sorted - rounded))]
+            v = cal_dict[float(nearest)]
+        return v
+
+    csv_path = DATA_DIR / f"{part_id}_combined_{timestamp}.csv"
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['# Combined Diameter Scan Report'])
+        w.writerow(['# Part_ID', part_id])
+        w.writerow(['# Timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+        w.writerow(['# Calibration_File', cal_file_name])
+        w.writerow(['# B19_Calibrated_Diameter', f"{b19:.6f}"])
+        w.writerow(['# F25_Nominal_Mean', f"{f25_nominal:.6f}"])
+        w.writerow(['# Raw_Diameter', f"{raw_fit.diameter:.6f}"])
+        w.writerow(['# Raw_RMS_Residual', f"{raw_fit.residual_rms:.6f}"])
+        w.writerow(['# Raw_R_Squared', f"{raw_fit.r_squared:.8f}"])
+        w.writerow(['# Calibrated_Diameter', f"{cal_fit.diameter:.6f}"])
+        w.writerow(['# Calibrated_RMS_Residual', f"{cal_fit.residual_rms:.6f}"])
+        w.writerow(['# Calibrated_R_Squared', f"{cal_fit.r_squared:.8f}"])
+        w.writerow([])
+        w.writerow(['Degree', 'Raw_B21', 'F25_cal', 'Offset_Applied', 'Calibrated_B21'])
+        for raw_pt, cal_pt in zip(raw_meas, cal_meas):
+            f25 = lookup_f25(raw_pt.theta_deg)
+            offset = cal_pt.value - raw_pt.value
+            w.writerow([
+                f"{raw_pt.theta_deg:.3f}", f"{raw_pt.value:.6f}",
+                f"{f25:.6f}", f"{offset:.6f}", f"{cal_pt.value:.6f}",
+            ])
+    print(f"[Combined CSV] Saved: {csv_path}")
+
+    png_path = PLOTS_DIR / f"{part_id}_combined_{timestamp}.png"
+
+    raw_thetas = np.array([m.theta_deg for m in raw_meas])
+    raw_radii = np.array([m.value for m in raw_meas])
+    cal_radii = np.array([m.value for m in cal_meas])
+    raw_theta_rad = np.deg2rad(raw_thetas)
+    raw_x = raw_radii * np.cos(raw_theta_rad)
+    raw_y = raw_radii * np.sin(raw_theta_rad)
+    cal_x = cal_radii * np.cos(raw_theta_rad)
+    cal_y = cal_radii * np.sin(raw_theta_rad)
+
+    fig = plt.figure(figsize=(16, 12))
+
+    # Quadrant 1: Cartesian overlay (raw red, calibrated blue)
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.scatter(raw_x, raw_y, c='red', s=30, alpha=0.5, edgecolors='darkred',
+                linewidth=0.4, label='Raw points')
+    ax1.scatter(cal_x, cal_y, c='blue', s=30, alpha=0.5, edgecolors='darkblue',
+                linewidth=0.4, label='Calibrated points')
+    theta_circle = np.linspace(0, 2 * np.pi, 200)
+    rr = raw_fit.diameter / 2
+    rc = cal_fit.diameter / 2
+    ax1.plot(raw_fit.center_x + rr * np.cos(theta_circle),
+             raw_fit.center_y + rr * np.sin(theta_circle),
+             'r-', linewidth=1.5, label=f'Raw fit (D={raw_fit.diameter:.4f})')
+    ax1.plot(cal_fit.center_x + rc * np.cos(theta_circle),
+             cal_fit.center_y + rc * np.sin(theta_circle),
+             'b-', linewidth=1.5, label=f'Cal fit (D={cal_fit.diameter:.4f})')
+    ax1.plot(raw_fit.center_x, raw_fit.center_y, 'r+', markersize=12, markeredgewidth=2)
+    ax1.plot(cal_fit.center_x, cal_fit.center_y, 'b+', markersize=12, markeredgewidth=2)
+    ax1.set_xlabel('X (inches)')
+    ax1.set_ylabel('Y (inches)')
+    ax1.set_title(f'Raw vs Calibrated - Part {part_id}', fontsize=13, fontweight='bold')
+    ax1.axis('equal')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=8)
+
+    # Quadrant 2: Polar overlay
+    ax2 = plt.subplot(2, 2, 2, projection='polar')
+    ax2.scatter(raw_theta_rad, raw_radii, c='red', s=20, alpha=0.5, label='Raw')
+    ax2.scatter(raw_theta_rad, cal_radii, c='blue', s=20, alpha=0.5, label='Calibrated')
+    ax2.set_theta_zero_location('E')
+    ax2.set_theta_direction(1)
+    ax2.set_title('Polar Overlay (data-centered)', fontsize=13, fontweight='bold', pad=20)
+    all_r = np.concatenate([raw_radii, cal_radii])
+    r_min, r_max = all_r.min(), all_r.max()
+    pad = 0.1 * (r_max - r_min) if r_max > r_min else 0.1
+    ax2.set_ylim(r_min - pad, r_max + pad)
+    ax2.legend(loc='upper right', fontsize=8)
+
+    # Quadrant 3: Per-angle offset applied
+    ax3 = plt.subplot(2, 2, 3)
+    offsets = cal_radii - raw_radii
+    ax3.plot(raw_thetas, offsets, 'g-', linewidth=1)
+    ax3.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+    ax3.set_xlabel('Degree')
+    ax3.set_ylabel('Calibrated - Raw (inches)')
+    ax3.set_title('Per-Angle Calibration Offset', fontsize=13, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+
+    # Quadrant 4: Stats table
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.axis('off')
+    raw_pct = 100 * raw_fit.residual_rms / (raw_fit.diameter / 2) if raw_fit.diameter else 0.0
+    cal_pct = 100 * cal_fit.residual_rms / (cal_fit.diameter / 2) if cal_fit.diameter else 0.0
+    rows = [
+        ['Metric', 'Raw', 'Calibrated'],
+        ['Points', f'{len(raw_meas)}', f'{len(cal_meas)}'],
+        ['Diameter (in)', f'{raw_fit.diameter:.4f}', f'{cal_fit.diameter:.4f}'],
+        ['Radius (in)', f'{raw_fit.diameter/2:.4f}', f'{cal_fit.diameter/2:.4f}'],
+        ['Center X', f'{raw_fit.center_x:.4f}', f'{cal_fit.center_x:.4f}'],
+        ['Center Y', f'{raw_fit.center_y:.4f}', f'{cal_fit.center_y:.4f}'],
+        ['RMS Residual', f'{raw_fit.residual_rms:.4f}', f'{cal_fit.residual_rms:.4f}'],
+        ['Max Residual', f'{raw_fit.max_residual:.4f}', f'{cal_fit.max_residual:.4f}'],
+        ['RMS Error %', f'{raw_pct:.3f}', f'{cal_pct:.3f}'],
+        ['R^2', f'{raw_fit.r_squared:.6f}', f'{cal_fit.r_squared:.6f}'],
+        ['', '', ''],
+        ['B19 (live)', f'{b19:.4f}', ''],
+        ['F25 nominal', f'{f25_nominal:.4f}', ''],
+        ['Cal file', cal_file_name, ''],
+    ]
+    tbl = ax4.table(cellText=rows, cellLoc='center', loc='center',
+                    colWidths=[0.34, 0.33, 0.33])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.6)
+    for col in range(3):
+        tbl[(0, col)].set_facecolor('#4CAF50')
+        tbl[(0, col)].set_text_props(weight='bold', color='white')
+    ax4.set_title(f'Summary - Part {part_id}', fontsize=13, fontweight='bold', pad=20)
+
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Combined Plot] Saved: {png_path}")
+
+    return csv_path, png_path
+
+
+def split_into_rotations(measurements, step_deg, num_rotations):
+    """Split a flat scan into per-rotation chunks with theta normalized to [0, 360).
+
+    Theta is normalized relative to the first measurement, so the result is
+    independent of where on the encoder the scan happened to start.
+    Trailing partial rotations (e.g. from an early Stop) are kept as-is.
+    """
+    per_rot = int(round(360.0 / step_deg))
+    base_theta = measurements[0].theta_deg if measurements else 0.0
+    rotations = []
+    for r in range(num_rotations):
+        chunk = measurements[r * per_rot:(r + 1) * per_rot]
+        if not chunk:
+            break
+        rotations.append([
+            MeasurementPoint((m.theta_deg - base_theta) % 360, m.value, m.timestamp, m.attempts)
+            for m in chunk
+        ])
+    return rotations
+
+
+def save_multi_rotation_report(part_id, rotations, fits,
+                                b19=None, f25_nominal=None, cal_file_name=None):
+    """Write CSV + PNG comparing N rotations of the same part.
+
+    `rotations` is a list of per-rotation MeasurementPoint lists (theta in
+    [0, 360)). `fits` is a parallel list of CircleFitResult.
+    Optional B19/F25_nominal/cal_file_name are recorded as metadata when
+    calibration was applied to the rotations before this call.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    n = len(rotations)
+    cal_applied = cal_file_name is not None
+
+    csv_path = DATA_DIR / f"{part_id}_multirotation_{timestamp}.csv"
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['# Multi-Rotation Diameter Scan Report'])
+        w.writerow(['# Part_ID', part_id])
+        w.writerow(['# Timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+        w.writerow(['# Num_Rotations', n])
+        w.writerow(['# Calibration_Applied', 'yes' if cal_applied else 'no'])
+        if cal_applied:
+            w.writerow(['# Calibration_File', cal_file_name])
+            w.writerow(['# B19_Calibrated_Diameter', f"{b19:.6f}"])
+            w.writerow(['# F25_Nominal_Mean', f"{f25_nominal:.6f}"])
+        for i, fit in enumerate(fits, start=1):
+            w.writerow([f'# Rotation_{i}_Diameter', f"{fit.diameter:.6f}"])
+            w.writerow([f'# Rotation_{i}_RMS_Residual', f"{fit.residual_rms:.6f}"])
+            w.writerow([f'# Rotation_{i}_Max_Residual', f"{fit.max_residual:.6f}"])
+            w.writerow([f'# Rotation_{i}_R_Squared', f"{fit.r_squared:.8f}"])
+        diameters = np.array([f.diameter for f in fits])
+        w.writerow(['# Diameter_Range_Across_Rotations', f"{diameters.max() - diameters.min():.6f}"])
+        w.writerow(['# Diameter_Stdev_Across_Rotations', f"{diameters.std():.6f}"])
+        w.writerow([])
+        w.writerow(['Rotation', 'Degree', 'Value'])
+        for i, rot in enumerate(rotations, start=1):
+            for m in rot:
+                w.writerow([i, f"{m.theta_deg:.3f}", f"{m.value:.6f}"])
+    print(f"[Multi-Rotation CSV] Saved: {csv_path}")
+
+    png_path = PLOTS_DIR / f"{part_id}_multirotation_{timestamp}.png"
+    colors = plt.cm.viridis(np.linspace(0, 0.85, max(n, 2)))
+
+    fig = plt.figure(figsize=(16, 12))
+
+    # Quadrant 1: Cartesian overlay
+    ax1 = plt.subplot(2, 2, 1)
+    theta_circle = np.linspace(0, 2 * np.pi, 200)
+    for i, (rot, fit) in enumerate(zip(rotations, fits)):
+        thetas = np.array([m.theta_deg for m in rot])
+        radii = np.array([m.value for m in rot])
+        tr = np.deg2rad(thetas)
+        ax1.scatter(radii * np.cos(tr), radii * np.sin(tr),
+                    c=[colors[i]], s=20, alpha=0.6, edgecolors='black',
+                    linewidth=0.3, label=f'Rot {i + 1} pts')
+        r = fit.diameter / 2
+        ax1.plot(fit.center_x + r * np.cos(theta_circle),
+                 fit.center_y + r * np.sin(theta_circle),
+                 color=colors[i], linewidth=1.4,
+                 label=f'Rot {i + 1} fit (D={fit.diameter:.4f})')
+        ax1.plot(fit.center_x, fit.center_y, '+', color=colors[i],
+                 markersize=10, markeredgewidth=2)
+    cal_tag = " (calibrated)" if cal_applied else ""
+    ax1.set_xlabel('X (inches)')
+    ax1.set_ylabel('Y (inches)')
+    ax1.set_title(f'Rotation Overlay - Part {part_id}{cal_tag}',
+                  fontsize=13, fontweight='bold')
+    ax1.axis('equal')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=7, ncol=2)
+
+    # Quadrant 2: Polar overlay
+    ax2 = plt.subplot(2, 2, 2, projection='polar')
+    all_radii = []
+    for i, rot in enumerate(rotations):
+        thetas = np.array([m.theta_deg for m in rot])
+        radii = np.array([m.value for m in rot])
+        all_radii.append(radii)
+        ax2.plot(np.deg2rad(thetas), radii, color=colors[i], linewidth=1,
+                 alpha=0.7, label=f'Rot {i + 1}')
+    ax2.set_theta_zero_location('E')
+    ax2.set_theta_direction(1)
+    ax2.set_title('Polar Overlay (data-centered)', fontsize=13, fontweight='bold', pad=20)
+    flat = np.concatenate(all_radii)
+    rmin, rmax = flat.min(), flat.max()
+    pad = 0.1 * (rmax - rmin) if rmax > rmin else 0.1
+    ax2.set_ylim(rmin - pad, rmax + pad)
+    ax2.legend(loc='upper right', fontsize=8)
+
+    # Quadrant 3: Per-angle deviation from cross-rotation mean
+    ax3 = plt.subplot(2, 2, 3)
+    if n >= 2:
+        cross_mean = {}
+        cross_count = {}
+        for rot in rotations:
+            for m in rot:
+                key = round(m.theta_deg % 360, 1)
+                cross_mean[key] = cross_mean.get(key, 0.0) + m.value
+                cross_count[key] = cross_count.get(key, 0) + 1
+        for key in cross_mean:
+            cross_mean[key] /= cross_count[key]
+
+        for i, rot in enumerate(rotations):
+            degs = np.array([m.theta_deg for m in rot])
+            deltas = np.array([
+                m.value - cross_mean[round(m.theta_deg % 360, 1)]
+                for m in rot
+            ])
+            ax3.plot(degs, deltas, color=colors[i], linewidth=1, alpha=0.8,
+                     label=f'Rot {i + 1}')
+        ax3.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+        ax3.set_xlabel('Degree')
+        ax3.set_ylabel('Value - mean across rotations (inches)')
+        ax3.set_title('Per-Angle Deviation from Cross-Rotation Mean',
+                      fontsize=13, fontweight='bold')
+        ax3.legend(fontsize=8, ncol=min(n, 4))
+        ax3.grid(True, alpha=0.3)
+    else:
+        ax3.axis('off')
+        ax3.text(0.5, 0.5, 'Need >=2 rotations for cross-rotation deviation',
+                 ha='center', va='center', fontsize=12, color='gray')
+
+    # Quadrant 4: Stats table
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.axis('off')
+    header = ['Rot', 'Points', 'Diameter', 'RMS Resid', 'Max Resid', 'R^2']
+    rows = [header]
+    for i, (rot, fit) in enumerate(zip(rotations, fits), start=1):
+        rows.append([
+            str(i), str(len(rot)),
+            f'{fit.diameter:.4f}', f'{fit.residual_rms:.5f}',
+            f'{fit.max_residual:.5f}', f'{fit.r_squared:.5f}',
+        ])
+    diameters = np.array([f.diameter for f in fits])
+    rmss = np.array([f.residual_rms for f in fits])
+    rows.append(['', '', '', '', '', ''])
+    rows.append(['Mean', '', f'{diameters.mean():.4f}', f'{rmss.mean():.5f}', '', ''])
+    rows.append(['Range', '', f'{diameters.max() - diameters.min():.4f}', '', '', ''])
+    rows.append(['Stdev', '', f'{diameters.std():.4f}', '', '', ''])
+
+    tbl = ax4.table(cellText=rows[1:], colLabels=rows[0], loc='center', cellLoc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.5)
+    for col in range(len(header)):
+        tbl[(0, col)].set_facecolor('#4CAF50')
+        tbl[(0, col)].set_text_props(weight='bold', color='white')
+    title = f'Summary - Part {part_id}{cal_tag}'
+    if cal_applied:
+        title += f'\nB19={b19:.4f}, F25_nom={f25_nominal:.4f}, cal={cal_file_name}'
+    ax4.set_title(title, fontsize=11, fontweight='bold', pad=20)
+
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Multi-Rotation Plot] Saved: {png_path}")
+
+    return csv_path, png_path
+
+
 def print_results(part_id, measurements, fit_result):
     print("\n" + "="*60)
     print(f"RESULTS - Part {part_id}")
