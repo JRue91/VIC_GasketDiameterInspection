@@ -32,7 +32,8 @@ import CalibrationScan
 from CalibrationScan import calibration_scan, save_calibration, load_calibration
 import CalibrationVerify
 from CalibrationVerify import (
-    find_calibration_files, compare, print_comparison, save_comparison_plot,
+    find_calibration_files, compare, print_comparison,
+    save_comparison_plot, save_multi_run_report,
 )
 
 
@@ -516,6 +517,13 @@ class CalibrationVerifyTab(ttk.Frame):
         self._step_label = ttk.Label(step_row, text="--", anchor=tk.W)
         self._step_label.pack(side=tk.LEFT)
 
+        # Number of runs
+        runs_row = ttk.Frame(form)
+        runs_row.pack(fill=tk.X, pady=2)
+        ttk.Label(runs_row, text="Number of Runs", width=18, anchor=tk.W).pack(side=tk.LEFT)
+        self.num_runs_var = tk.StringVar(value="1")
+        ttk.Entry(runs_row, textvariable=self.num_runs_var).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=8)
         self.start_btn = ttk.Button(btn_frame, text="Start Verification", command=self._start)
@@ -548,6 +556,14 @@ class CalibrationVerifyTab(ttk.Frame):
             messagebox.showerror("Validation", "Select a calibration file.")
             return
 
+        try:
+            num_runs = int(self.num_runs_var.get())
+            if num_runs <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Validation", "Number of runs must be a positive whole number.")
+            return
+
         cal_file = self._cal_files[idx]
         speed = self.app.settings.get_float("speed")
         accel = self.app.settings.get_float("accel")
@@ -556,15 +572,16 @@ class CalibrationVerifyTab(ttk.Frame):
         self.app.start_scan(
             "Calibration Verify",
             self._run_thread,
-            (cal_file, speed, accel, dwell),
+            (cal_file, speed, accel, dwell, num_runs),
         )
 
-    def _run_thread(self, cal_file, speed, accel, dwell):
+    def _run_thread(self, cal_file, speed, accel, dwell, num_runs):
         self.app.settings.apply_to_modules()
         stop_event = self.app._stop_event
 
         step_deg, cal_data = load_calibration(cal_file)
         print(f"Loaded {len(cal_data)} calibration points from {cal_file.name} (step={step_deg} deg)")
+        print(f"Will perform {num_runs} verification run(s).")
 
         zaber_conn = open_zaber_connection()
 
@@ -574,28 +591,37 @@ class CalibrationVerifyTab(ttk.Frame):
                 cognex = CognexConnection()
                 await cognex.connect()
                 try:
-                    return await calibration_scan(axis, cognex, step_deg,
-                                                  speed, accel, dwell,
-                                                  stop_event=stop_event)
+                    runs = []
+                    for i in range(num_runs):
+                        if stop_event.is_set():
+                            break
+                        print(f"\n###### RUN {i + 1} of {num_runs} ######")
+                        runs.append(await calibration_scan(
+                            axis, cognex, step_deg, speed, accel, dwell,
+                            stop_event=stop_event,
+                        ))
+                    return runs
                 finally:
                     await cognex.disconnect()
 
-        measurements = asyncio.run(run())
+        runs = asyncio.run(run())
 
-        if not measurements:
+        cal_id = cal_file.stem.replace("calibration_", "").rsplit("_", 2)[0]
+        all_run_results = []
+        for i, measurements in enumerate(runs, start=1):
+            if not measurements:
+                print(f"\n[Run {i}] No measurements collected; skipping.")
+                continue
+            results = compare(cal_data, measurements)
+            print(f"\n--- Run {i} of {len(runs)} ---")
+            print_comparison(results)
+            all_run_results.append(results)
+
+        if not all_run_results:
             self.app._result_queue.put(("error", "No measurements collected."))
             return
 
-        results = compare(cal_data, measurements)
-        print_comparison(results)
-
-        cal_id = cal_file.stem.replace("calibration_", "").rsplit("_", 2)[0]
-        save_comparison_plot(results, cal_id)
-
-        # Find the latest verification plot
-        verify_dir = CalibrationVerify.VERIFY_PLOTS_DIR
-        plot_files = sorted(verify_dir.glob(f"verify_{cal_id}_*.png"))
-        plot_path = plot_files[-1] if plot_files else None
+        plot_path, _csv_path = save_multi_run_report(all_run_results, cal_id)
 
         self.app._result_queue.put(("complete", {"plot_path": plot_path}))
 

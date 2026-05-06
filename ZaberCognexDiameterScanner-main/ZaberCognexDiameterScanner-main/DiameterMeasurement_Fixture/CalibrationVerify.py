@@ -7,6 +7,7 @@ against the stored calibration values.
 """
 
 import time
+import csv
 import asyncio
 import numpy as np
 import matplotlib.pyplot as plt
@@ -155,6 +156,114 @@ def save_comparison_plot(results, cal_id):
     print(f"[Plot] Saved: {filename}")
 
 
+def save_multi_run_report(all_run_results, cal_id):
+    """Save a consolidated report (PNG plot + CSV) for one or more verification runs.
+
+    `all_run_results` is a list where each element is a `results` list returned
+    by `compare()` for one run. Returns (plot_path, csv_path).
+    """
+    VERIFY_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    num_runs = len(all_run_results)
+
+    csv_path = VERIFY_PLOTS_DIR / f"verify_report_{cal_id}_{num_runs}runs_{timestamp}.csv"
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Run', 'Degree', 'Measured', 'Calibration', 'Difference'])
+        for run_idx, results in enumerate(all_run_results, start=1):
+            for r in results:
+                writer.writerow([
+                    run_idx,
+                    f"{r['degree']:.3f}",
+                    f"{r['measured']:.6f}",
+                    f"{r['calibration']:.6f}",
+                    f"{r['difference']:.6f}",
+                ])
+    print(f"[Report CSV] Saved: {csv_path}")
+
+    fig, axes = plt.subplots(4, 1, figsize=(14, 16))
+    colors = plt.cm.viridis(np.linspace(0, 0.85, max(num_runs, 2)))
+
+    ax1 = axes[0]
+    ref_results = all_run_results[0]
+    ref_degs = [r['degree'] for r in ref_results]
+    ref_cal = [r['calibration'] for r in ref_results]
+    ax1.plot(ref_degs, ref_cal, 'b-', linewidth=1.8, alpha=0.9, label='Calibration')
+    for i, results in enumerate(all_run_results):
+        degs = [r['degree'] for r in results]
+        measured = [r['measured'] for r in results]
+        ax1.plot(degs, measured, color=colors[i], linewidth=0.9, alpha=0.75,
+                 label=f'Run {i + 1}')
+    ax1.set_xlabel('Degree')
+    ax1.set_ylabel('Value')
+    ax1.set_title(f'Calibration vs Measured ({num_runs} run{"s" if num_runs != 1 else ""}) - {cal_id}',
+                  fontsize=13, fontweight='bold')
+    ax1.legend(loc='best', fontsize=8, ncol=2)
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = axes[1]
+    ax2.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+    for i, results in enumerate(all_run_results):
+        degs = [r['degree'] for r in results]
+        diffs = [r['difference'] for r in results]
+        ax2.plot(degs, diffs, color=colors[i], linewidth=0.9, alpha=0.75,
+                 label=f'Run {i + 1}')
+    ax2.set_xlabel('Degree')
+    ax2.set_ylabel('Difference (Measured - Cal)')
+    ax2.set_title('Error by Position', fontsize=13, fontweight='bold')
+    ax2.legend(loc='best', fontsize=8, ncol=2)
+    ax2.grid(True, alpha=0.3)
+
+    ax3 = axes[2]
+    all_diffs = [r['difference'] for results in all_run_results for r in results]
+    ax3.hist(all_diffs, bins=50, edgecolor='black', alpha=0.7)
+    ax3.axvline(x=np.mean(all_diffs), color='red', linestyle='--', linewidth=1.5,
+                label=f'Mean: {np.mean(all_diffs):.6f}')
+    ax3.set_xlabel('Difference')
+    ax3.set_ylabel('Count')
+    ax3.set_title('Combined Error Distribution', fontsize=13, fontweight='bold')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    ax4 = axes[3]
+    ax4.axis('off')
+    table_header = ['Run', 'N', 'Mean', 'Std', 'Min', 'Max', 'Mean |diff|', 'Max |diff|']
+    table_rows = []
+    for i, results in enumerate(all_run_results, start=1):
+        diffs = [r['difference'] for r in results]
+        abs_diffs = [abs(d) for d in diffs]
+        table_rows.append([
+            str(i), str(len(diffs)),
+            f"{np.mean(diffs):.6f}", f"{np.std(diffs):.6f}",
+            f"{min(diffs):.6f}", f"{max(diffs):.6f}",
+            f"{np.mean(abs_diffs):.6f}", f"{max(abs_diffs):.6f}",
+        ])
+    all_abs = [abs(d) for d in all_diffs]
+    table_rows.append([
+        'ALL', str(len(all_diffs)),
+        f"{np.mean(all_diffs):.6f}", f"{np.std(all_diffs):.6f}",
+        f"{min(all_diffs):.6f}", f"{max(all_diffs):.6f}",
+        f"{np.mean(all_abs):.6f}", f"{max(all_abs):.6f}",
+    ])
+    tbl = ax4.table(cellText=table_rows, colLabels=table_header,
+                    loc='center', cellLoc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.5)
+    for col in range(len(table_header)):
+        tbl[(len(table_rows), col)].set_facecolor('#e8f4ff')
+        tbl[(len(table_rows), col)].set_text_props(weight='bold')
+    ax4.set_title('Summary Statistics', fontsize=13, fontweight='bold', pad=20)
+
+    plt.tight_layout()
+    plot_path = VERIFY_PLOTS_DIR / f"verify_report_{cal_id}_{num_runs}runs_{timestamp}.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Report Plot] Saved: {plot_path}")
+
+    return plot_path, csv_path
+
+
 def main():
     if not telnetlib3:
         print("ERROR: Install telnetlib3")
@@ -187,7 +296,14 @@ def main():
     print(f"Step size from calibration file: {step_deg} deg")
 
     num_steps = int(360.0 / step_deg)
-    print(f"\nThis will take {num_steps} measurements at {step_deg} deg increments.")
+    runs_input = input("Number of verification runs [default: 1]: ").strip()
+    try:
+        num_runs = max(1, int(runs_input)) if runs_input else 1
+    except ValueError:
+        print("Invalid number of runs; defaulting to 1.")
+        num_runs = 1
+
+    print(f"\nThis will take {num_steps} measurements x {num_runs} run(s) at {step_deg} deg increments.")
     confirm = input("Proceed? (y/n): ").strip().lower()
     if confirm not in ('y', 'yes'):
         print("Cancelled.")
@@ -203,24 +319,32 @@ def main():
             await cognex.connect()
 
             try:
-                measurements = await calibration_scan(axis, cognex, step_deg, SPEED_DEG_S, ACCEL_DEG_S2, DWELL_S)
-                return measurements
+                runs = []
+                for i in range(num_runs):
+                    print(f"\n###### RUN {i + 1} of {num_runs} ######")
+                    runs.append(await calibration_scan(axis, cognex, step_deg, SPEED_DEG_S, ACCEL_DEG_S2, DWELL_S))
+                return runs
             finally:
                 await cognex.disconnect()
 
-    measurements = asyncio.run(run_verification())
+    runs = asyncio.run(run_verification())
 
-    if not measurements:
-        print("\nERROR: No measurements collected")
+    cal_id = cal_file.stem.replace("calibration_", "").rsplit("_", 2)[0]
+    all_run_results = []
+    for i, measurements in enumerate(runs, start=1):
+        if not measurements:
+            print(f"\nERROR: Run {i} collected no measurements; skipping.")
+            continue
+        results = compare(cal_data, measurements)
+        print(f"\n--- Run {i} of {len(runs)} ---")
+        print_comparison(results)
+        all_run_results.append(results)
+
+    if not all_run_results:
+        print("\nERROR: No usable runs.")
         return
 
-    # Compare against calibration
-    results = compare(cal_data, measurements)
-    print_comparison(results)
-
-    # Extract cal_id from filename for plot labeling
-    cal_id = cal_file.stem.replace("calibration_", "").rsplit("_", 2)[0]
-    save_comparison_plot(results, cal_id)
+    save_multi_run_report(all_run_results, cal_id)
 
     print("\n[Complete]\n")
 
