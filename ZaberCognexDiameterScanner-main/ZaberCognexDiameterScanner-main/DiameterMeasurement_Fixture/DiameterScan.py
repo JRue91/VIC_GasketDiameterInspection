@@ -345,31 +345,65 @@ def save_plot(measurements, fit_result, part_id):
     print(f"[Plot] Saved: {filename}")
 
 
-def save_csv(part_id, measurements, fit_result):
+SUMMARY_CSV_HEADER = [
+    'Timestamp', 'Part_ID', 'Num_Measurements', 'Center_X_inches', 'Center_Y_inches',
+    'Diameter_inches', 'Radius_inches', 'RMS_Residual_inches', 'Max_Residual_inches',
+    'R_Squared', 'Relative_RMS_Error_percent', 'Recipe', 'Nominal', 'Result',
+]
+
+
+def _recipe_metadata_rows(recipe, verdict):
+    """Return '#'-prefixed metadata rows describing the recipe + verdict.
+
+    Empty list when no recipe is supplied, so reports run without a recipe are
+    byte-for-byte unchanged.
+    """
+    if recipe is None:
+        return []
+    rows = [
+        ['# Recipe', recipe.name],
+        ['# Cognex_Job', recipe.cognex_job],
+        ['# Nominal', f"{recipe.nominal_diameter:.6f}"],
+        ['# Tol_Plus', f"{recipe.tol_plus:.6f}"],
+        ['# Tol_Minus', f"{recipe.tol_minus:.6f}"],
+    ]
+    if recipe.rms_limit is not None:
+        rows.append(['# RMS_Limit', f"{recipe.rms_limit:.6f}"])
+    if recipe.repeatability_limit is not None:
+        rows.append(['# Repeatability_Limit', f"{recipe.repeatability_limit:.6f}"])
+    if verdict is not None:
+        rows.append(['# Result', 'PASS' if verdict.passed else 'FAIL'])
+    return rows
+
+
+def save_csv(part_id, measurements, fit_result, recipe=None, verdict=None):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     csvs = sorted(DATA_DIR.glob("diameter_measurements_*.csv"))
     csv_file = None
-    
+
     if csvs:
         latest = csvs[-1]
         try:
-            with open(latest) as f:
-                if sum(1 for _ in f) - 1 < MAX_RECORDS_PER_CSV:
-                    csv_file = latest
+            with open(latest, newline='') as f:
+                rows = list(csv.reader(f))
+            # Only reuse a rolling file whose header matches the current schema
+            # (older files predate the Recipe/Nominal/Result columns).
+            if rows and rows[0] == SUMMARY_CSV_HEADER and len(rows) - 1 < MAX_RECORDS_PER_CSV:
+                csv_file = latest
         except:
             pass
-    
+
     if not csv_file:
         csv_file = DATA_DIR / f"diameter_measurements_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         with open(csv_file, 'w', newline='') as f:
-            csv.writer(f).writerow([
-                'Timestamp', 'Part_ID', 'Num_Measurements', 'Center_X_inches', 'Center_Y_inches',
-                'Diameter_inches', 'Radius_inches', 'RMS_Residual_inches', 'Max_Residual_inches',
-                'R_Squared', 'Relative_RMS_Error_percent'
-            ])
+            csv.writer(f).writerow(SUMMARY_CSV_HEADER)
         print(f"[Data] Created: {csv_file}")
-    
+
+    recipe_name = recipe.name if recipe is not None else ''
+    nominal = f"{recipe.nominal_diameter:.6f}" if recipe is not None else ''
+    result = ('PASS' if verdict.passed else 'FAIL') if verdict is not None else ''
+
     with open(csv_file, 'a', newline='') as f:
         csv.writer(f).writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), part_id, len(measurements),
@@ -377,7 +411,8 @@ def save_csv(part_id, measurements, fit_result):
             f"{fit_result.diameter:.6f}", f"{fit_result.diameter/2:.6f}",
             f"{fit_result.residual_rms:.6f}", f"{fit_result.max_residual:.6f}",
             f"{fit_result.r_squared:.8f}",
-            f"{100*fit_result.residual_rms/(fit_result.diameter/2):.4f}"
+            f"{100*fit_result.residual_rms/(fit_result.diameter/2):.4f}",
+            recipe_name, nominal, result,
         ])
     print(f"[Data] Appended to: {csv_file}")
 
@@ -408,10 +443,12 @@ def apply_calibration(measurements, cal_data):
 
 
 def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
-                          b19, f25_nominal, cal_data, cal_file_name):
+                          b19, f25_nominal, cal_data, cal_file_name,
+                          recipe=None, verdict=None):
     """Write a combined CSV + PNG report comparing raw and calibrated runs.
 
-    Returns (csv_path, png_path).
+    Returns (csv_path, png_path). When `recipe`/`verdict` are supplied, the
+    recipe criteria and PASS/FAIL result are recorded in the metadata header.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -443,6 +480,8 @@ def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
         w.writerow(['# Calibrated_Diameter', f"{cal_fit.diameter:.6f}"])
         w.writerow(['# Calibrated_RMS_Residual', f"{cal_fit.residual_rms:.6f}"])
         w.writerow(['# Calibrated_R_Squared', f"{cal_fit.r_squared:.8f}"])
+        for row in _recipe_metadata_rows(recipe, verdict):
+            w.writerow(row)
         w.writerow([])
         w.writerow(['Degree', 'Raw_B21', 'F25_cal', 'Offset_Applied', 'Calibrated_B21'])
         for raw_pt, cal_pt in zip(raw_meas, cal_meas):
@@ -575,7 +614,8 @@ def split_into_rotations(measurements, step_deg, num_rotations):
 
 
 def save_multi_rotation_report(part_id, rotations, fits,
-                                b19=None, f25_nominal=None, cal_file_name=None):
+                                b19=None, f25_nominal=None, cal_file_name=None,
+                                recipe=None, verdict=None):
     """Write CSV + PNG comparing N rotations of the same part.
 
     `rotations` is a list of per-rotation MeasurementPoint lists (theta in
@@ -609,6 +649,8 @@ def save_multi_rotation_report(part_id, rotations, fits,
         diameters = np.array([f.diameter for f in fits])
         w.writerow(['# Diameter_Range_Across_Rotations', f"{diameters.max() - diameters.min():.6f}"])
         w.writerow(['# Diameter_Stdev_Across_Rotations', f"{diameters.std():.6f}"])
+        for row in _recipe_metadata_rows(recipe, verdict):
+            w.writerow(row)
         w.writerow([])
         w.writerow(['Rotation', 'Degree', 'Value'])
         for i, rot in enumerate(rotations, start=1):

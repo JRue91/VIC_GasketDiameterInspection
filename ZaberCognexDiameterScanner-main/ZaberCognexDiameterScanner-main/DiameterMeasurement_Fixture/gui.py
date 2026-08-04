@@ -11,6 +11,7 @@ import io
 import threading
 import queue
 import asyncio
+from types import SimpleNamespace
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from pathlib import Path
@@ -25,13 +26,15 @@ from PIL import Image
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import common
-from common import CognexConnection, open_zaber_connection, setup_zaber_axis
+from common import CognexConnection, open_zaber_connection, setup_zaber_axis, list_jobs_ftp
 import DiameterScan
 from DiameterScan import (
     sequencer, fit_circle, save_plot, save_csv, print_results,
     apply_calibration, save_combined_report,
     split_into_rotations, save_multi_rotation_report,
 )
+import recipe as recipe_store
+from recipe import Recipe, evaluate_recipe
 import CalibrationScan
 from CalibrationScan import calibration_scan, save_calibration, load_calibration
 import CalibrationVerify
@@ -200,6 +203,273 @@ class SettingsManager:
 
 
 # ---------------------------------------------------------------------------
+# Recipe Manager (selection + per-recipe settings dialogs)
+# ---------------------------------------------------------------------------
+
+class RecipeManager:
+    """Owns recipe persistence, the active recipe, and the recipe dialogs.
+
+    A recipe is a full product profile (Cognex job + scan params + pass/fail
+    criteria). Selecting one makes it active; the Diameter Scan tab then drives
+    its run from the recipe and evaluates the result on the app side.
+    """
+
+    # Fields shown in the editor: (var key, label, is_optional)
+    EDITOR_FIELDS = [
+        ("diameter_cell", "Diameter Cell", False),
+        ("step_deg", "Step Size (deg)", False),
+        ("num_rotations", "Rotations", False),
+        ("nominal_diameter", "Nominal Diameter", False),
+        ("tol_plus", "Tolerance +", False),
+        ("tol_minus", "Tolerance -", False),
+        ("rms_limit", "RMS Limit (blank=off)", True),
+        ("repeatability_limit", "Repeatability Limit (blank=off)", True),
+    ]
+
+    def __init__(self, root: tk.Tk, app: "GasketInspectorApp"):
+        self._root = root
+        self.app = app
+        self.recipes: dict[str, Recipe] = recipe_store.load_recipes()
+        self.active: Recipe | None = None
+
+    def active_name(self) -> str | None:
+        return self.active.name if self.active else None
+
+    def set_active(self, name: str | None):
+        self.active = self.recipes.get(name) if name else None
+        self.app.status_bar.set_recipe(self.active_name())
+        self.app.status_bar.set_verdict(None)
+        self.app.diameter_tab.apply_recipe(self.active)
+        if self.active:
+            print(f"[Recipe] Active recipe: {self.active.name}")
+
+    # -- Selector dialog --
+
+    def open_selector(self):
+        if not self.recipes:
+            messagebox.showinfo(
+                "Recipes",
+                "No recipes defined yet.\nUse Recipe → Edit Recipes… to create one.",
+            )
+            return
+        dlg = self._make_dialog("Select Recipe")
+
+        ttk.Label(dlg, text="Recipe:").pack(anchor=tk.W, padx=12, pady=(12, 2))
+        listbox = tk.Listbox(dlg, height=8, exportselection=False)
+        for name in sorted(self.recipes):
+            listbox.insert(tk.END, name)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
+        # Preselect the active recipe
+        names = sorted(self.recipes)
+        if self.active and self.active.name in names:
+            listbox.selection_set(names.index(self.active.name))
+
+        def _apply():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showwarning("Select Recipe", "Pick a recipe.", parent=dlg)
+                return
+            self.set_active(names[sel[0]])
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Clear Active", command=lambda: (self.set_active(None), dlg.destroy())).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Set Active", command=_apply).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+        self._center(dlg)
+
+    # -- Editor dialog --
+
+    def open_editor(self):
+        dlg = self._make_dialog("Edit Recipes")
+        self._edit_jobs: list[str] = []
+        self._edit_cal_files = find_calibration_files()
+
+        vars_ = {k: tk.StringVar() for k, _, _ in self.EDITOR_FIELDS}
+        name_var = tk.StringVar()
+        job_var = tk.StringVar()
+        cal_var = tk.StringVar()
+
+        top = ttk.Frame(dlg, padding=12)
+        top.pack(fill=tk.BOTH, expand=True)
+
+        # Recipe picker (existing names) + New
+        ttk.Label(top, text="Recipe", anchor=tk.W).grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+        name_combo = ttk.Combobox(top, textvariable=name_var, width=24, values=sorted(self.recipes))
+        name_combo.grid(row=0, column=1, sticky=tk.EW, pady=2)
+
+        # Cognex job (populated from FTP)
+        ttk.Label(top, text="Cognex Job", anchor=tk.W).grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+        job_combo = ttk.Combobox(top, textvariable=job_var, width=24, state="readonly")
+        job_combo.grid(row=1, column=1, sticky=tk.EW, pady=2)
+        ttk.Button(top, text="Refresh Jobs",
+                   command=lambda: self._refresh_jobs(job_combo)).grid(row=1, column=2, padx=(6, 0))
+
+        # Calibration file
+        ttk.Label(top, text="Calibration File", anchor=tk.W).grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+        cal_combo = ttk.Combobox(top, textvariable=cal_var, width=24, state="readonly",
+                                 values=["(none)"] + [f.name for f in self._edit_cal_files])
+        cal_combo.current(0)
+        cal_combo.grid(row=2, column=1, sticky=tk.EW, pady=2)
+
+        # Remaining scalar fields
+        for i, (key, label, _opt) in enumerate(self.EDITOR_FIELDS, start=3):
+            ttk.Label(top, text=label, anchor=tk.W).grid(row=i, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+            ttk.Entry(top, textvariable=vars_[key], width=26).grid(row=i, column=1, sticky=tk.EW, pady=2)
+        top.columnconfigure(1, weight=1)
+
+        def _load_selected(event=None):
+            r = self.recipes.get(name_var.get())
+            if not r:
+                return
+            job_combo["values"] = sorted(set(self._edit_jobs) | ({r.cognex_job} if r.cognex_job else set()))
+            job_var.set(r.cognex_job)
+            cal_names = [f.name for f in self._edit_cal_files]
+            cal_var.set(r.calibration_file if r.calibration_file in cal_names else "(none)")
+            vars_["diameter_cell"].set(r.diameter_cell)
+            vars_["step_deg"].set(str(r.step_deg))
+            vars_["num_rotations"].set(str(r.num_rotations))
+            vars_["nominal_diameter"].set(str(r.nominal_diameter))
+            vars_["tol_plus"].set(str(r.tol_plus))
+            vars_["tol_minus"].set(str(r.tol_minus))
+            vars_["rms_limit"].set("" if r.rms_limit is None else str(r.rms_limit))
+            vars_["repeatability_limit"].set("" if r.repeatability_limit is None else str(r.repeatability_limit))
+
+        name_combo.bind("<<ComboboxSelected>>", _load_selected)
+
+        def _new():
+            name_var.set("")
+            job_var.set("")
+            cal_combo.current(0)
+            vars_["diameter_cell"].set("B21")
+            vars_["step_deg"].set("5")
+            vars_["num_rotations"].set("1")
+            for k in ("nominal_diameter", "tol_plus", "tol_minus", "rms_limit", "repeatability_limit"):
+                vars_[k].set("")
+
+        def _save():
+            try:
+                r = self._gather(name_var, job_var, cal_var, vars_)
+            except ValueError as e:
+                messagebox.showerror("Recipe", str(e), parent=dlg)
+                return
+            self.recipes[r.name] = r
+            recipe_store.save_recipes(self.recipes)
+            name_combo["values"] = sorted(self.recipes)
+            if self.active and self.active.name == r.name:
+                self.set_active(r.name)  # re-apply edited active recipe
+            messagebox.showinfo("Recipe", f"Saved '{r.name}'.", parent=dlg)
+
+        def _delete():
+            name = name_var.get().strip()
+            if name not in self.recipes:
+                messagebox.showwarning("Recipe", "Select an existing recipe to delete.", parent=dlg)
+                return
+            if not messagebox.askyesno("Recipe", f"Delete recipe '{name}'?", parent=dlg):
+                return
+            del self.recipes[name]
+            recipe_store.save_recipes(self.recipes)
+            name_combo["values"] = sorted(self.recipes)
+            if self.active and self.active.name == name:
+                self.set_active(None)
+            _new()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ttk.Button(btns, text="New", command=_new).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Delete", command=_delete).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Save", command=_save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        if self.active and self.active.name in self.recipes:
+            name_var.set(self.active.name)
+            _load_selected()
+        self._center(dlg)
+
+    # -- Helpers --
+
+    def _gather(self, name_var, job_var, cal_var, vars_) -> Recipe:
+        name = name_var.get().strip()
+        if not name:
+            raise ValueError("Recipe name is required.")
+
+        def _req_float(key, label):
+            try:
+                return float(vars_[key].get())
+            except ValueError:
+                raise ValueError(f"{label} must be a number.")
+
+        def _opt_float(key, label):
+            txt = vars_[key].get().strip()
+            if not txt:
+                return None
+            try:
+                return float(txt)
+            except ValueError:
+                raise ValueError(f"{label} must be a number or blank.")
+
+        try:
+            step_deg = int(vars_["step_deg"].get())
+            num_rotations = int(vars_["num_rotations"].get())
+            if step_deg <= 0 or num_rotations <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Step size and rotations must be positive whole numbers.")
+
+        cal = cal_var.get()
+        cal_file = None if cal in ("", "(none)") else cal
+
+        return Recipe(
+            name=name,
+            cognex_job=job_var.get().strip(),
+            diameter_cell=vars_["diameter_cell"].get().strip() or "B21",
+            step_deg=step_deg,
+            num_rotations=num_rotations,
+            calibration_file=cal_file,
+            nominal_diameter=_req_float("nominal_diameter", "Nominal diameter"),
+            tol_plus=_req_float("tol_plus", "Tolerance +"),
+            tol_minus=_req_float("tol_minus", "Tolerance -"),
+            rms_limit=_opt_float("rms_limit", "RMS limit"),
+            repeatability_limit=_opt_float("repeatability_limit", "Repeatability limit"),
+        )
+
+    def _refresh_jobs(self, job_combo):
+        self._root.config(cursor="watch")
+        self._root.update_idletasks()
+        try:
+            jobs = list_jobs_ftp()
+        except Exception as e:
+            messagebox.showerror(
+                "Cognex FTP",
+                f"Could not list jobs from the sensor FTP:\n{type(e).__name__}: {e}",
+            )
+            return
+        finally:
+            self._root.config(cursor="")
+        self._edit_jobs = jobs
+        job_combo["values"] = jobs
+        print(f"[Recipe] Found {len(jobs)} job(s) on the Cognex.")
+        if not jobs:
+            messagebox.showinfo("Cognex FTP", "No .job files found on the sensor.")
+
+    def _make_dialog(self, title) -> tk.Toplevel:
+        dlg = tk.Toplevel(self._root)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self._root)
+        return dlg
+
+    def _center(self, dlg):
+        dlg.update_idletasks()
+        pw, ph = self._root.winfo_width(), self._root.winfo_height()
+        px, py = self._root.winfo_x(), self._root.winfo_y()
+        dw, dh = dlg.winfo_width(), dlg.winfo_height()
+        dlg.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+
+# ---------------------------------------------------------------------------
 # Log Panel
 # ---------------------------------------------------------------------------
 
@@ -285,20 +555,45 @@ class PlotPanel(ttk.Frame):
 # ---------------------------------------------------------------------------
 
 class StatusBar(ttk.Frame):
-    """Shows current scan state."""
+    """Shows current scan state, the active recipe, and the last PASS/FAIL."""
 
     def __init__(self, parent):
         super().__init__(parent)
         lf = ttk.LabelFrame(self, text="Status", padding=6)
         lf.pack(fill=tk.X, padx=4, pady=4)
 
+        row = ttk.Frame(lf)
+        row.pack(fill=tk.X)
+
+        ttk.Label(row, text="Scan:").pack(side=tk.LEFT)
         self._status_var = tk.StringVar(value="Idle")
-        ttk.Label(lf, text="Scan:").pack(anchor=tk.W)
-        self._label = ttk.Label(lf, textvariable=self._status_var, font=("Segoe UI", 10, "bold"))
-        self._label.pack(anchor=tk.W, padx=(10, 0))
+        ttk.Label(row, textvariable=self._status_var,
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(4, 16))
+
+        self._recipe_var = tk.StringVar(value="Recipe: (none)")
+        ttk.Label(row, textvariable=self._recipe_var,
+                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 16))
+
+        self._verdict_var = tk.StringVar(value="")
+        self._verdict_label = tk.Label(row, textvariable=self._verdict_var,
+                                       font=("Segoe UI", 12, "bold"))
+        self._verdict_label.pack(side=tk.LEFT)
 
     def set(self, text: str):
         self._status_var.set(text)
+
+    def set_recipe(self, name):
+        self._recipe_var.set(f"Recipe: {name}" if name else "Recipe: (none)")
+
+    def set_verdict(self, passed):
+        if passed is None:
+            self._verdict_var.set("")
+        elif passed:
+            self._verdict_var.set("PASS")
+            self._verdict_label.configure(foreground="#0a0")
+        else:
+            self._verdict_var.set("FAIL")
+            self._verdict_label.configure(foreground="#c00")
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +606,37 @@ class DiameterScanTab(ttk.Frame):
     def __init__(self, parent, app: "GasketInspectorApp"):
         super().__init__(parent)
         self.app = app
+        self._active_recipe = None
         self._build()
+
+    def apply_recipe(self, recipe):
+        """Populate the tab fields from an active recipe (or clear the binding)."""
+        self._active_recipe = recipe
+        if recipe is None:
+            return
+        self.step_var.set(str(recipe.step_deg))
+        self.rotations_var.set(str(recipe.num_rotations))
+        if recipe.calibration_file:
+            self.apply_cal_var.set(True)
+            self._on_apply_cal_toggled()
+            self._refresh_cal_files()
+            names = [f.name for f in self._cal_files]
+            if recipe.calibration_file in names:
+                self.cal_file_combo.current(names.index(recipe.calibration_file))
+        else:
+            self.apply_cal_var.set(False)
+            self._on_apply_cal_toggled()
+
+    def _evaluate(self, recipe, fit, rotation_fits=None):
+        """Run app-side pass/fail evaluation and log the breakdown.
+
+        Returns a recipe.Verdict, or None when no recipe is active.
+        """
+        if recipe is None:
+            return None
+        verdict = evaluate_recipe(recipe, fit, rotation_fits=rotation_fits)
+        print("\n[Evaluation] " + verdict.summary())
+        return verdict
 
     def _build(self):
         form = ttk.LabelFrame(self, text="Diameter Scan Parameters", padding=10)
@@ -404,11 +729,13 @@ class DiameterScanTab(ttk.Frame):
         self.app.start_scan(
             "Diameter Scan",
             self._run_thread,
-            (part_id, step_deg, num_rotations, speed, accel, dwell, cal_file),
+            (part_id, step_deg, num_rotations, speed, accel, dwell, cal_file, self._active_recipe),
         )
 
-    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell, cal_file):
+    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell, cal_file, recipe=None):
         self.app.settings.apply_to_modules()
+        if recipe is not None and recipe.diameter_cell:
+            DiameterScan.COGNEX_CELL = recipe.diameter_cell
         stop_event = self.app._stop_event
 
         cal_data = None
@@ -424,6 +751,12 @@ class DiameterScanTab(ttk.Frame):
                 cognex = CognexConnection()
                 await cognex.connect()
                 try:
+                    if recipe is not None and recipe.cognex_job:
+                        loaded = await cognex.load_job(recipe.cognex_job)
+                        if not loaded:
+                            raise RuntimeError(
+                                f"Failed to load Cognex job '{recipe.cognex_job}' for recipe '{recipe.name}'."
+                            )
                     b19_value = None
                     if cal_data is not None:
                         b19_value = await cognex.read_cell("B19")
@@ -465,37 +798,51 @@ class DiameterScanTab(ttk.Frame):
                     tag += " (calibrated)"
                 print_results(tag, rot, fit)
 
+            # Evaluate the cross-rotation mean diameter/RMS; repeatability uses
+            # the per-rotation fits.
+            agg = SimpleNamespace(
+                diameter=sum(f.diameter for f in fits) / len(fits),
+                residual_rms=sum(f.residual_rms for f in fits) / len(fits),
+            )
+            verdict = self._evaluate(recipe, agg, rotation_fits=fits)
+
             _csv_path, png_path = save_multi_rotation_report(
                 part_id, rotations, fits,
                 b19=b19 if cal_data is not None else None,
                 f25_nominal=f25_nominal,
                 cal_file_name=cal_file.name if cal_file is not None else None,
+                recipe=recipe, verdict=verdict,
             )
-            self.app._result_queue.put(("complete", {"plot_path": png_path}))
+            self.app._result_queue.put(("complete", {"plot_path": png_path, "verdict": verdict}))
             return
 
         # ---- Single-rotation branches ----
         fit = fit_circle(measurements)
 
         if cal_data is None:
-            save_csv(part_id, measurements, fit)
+            verdict = self._evaluate(recipe, fit)
+            save_csv(part_id, measurements, fit, recipe=recipe, verdict=verdict)
             print_results(part_id, measurements, fit)
             save_plot(measurements, fit, part_id)
             plot_files = sorted(DiameterScan.PLOTS_DIR.glob(f"{part_id}_circle_fit_result_*.png"))
             plot_path = plot_files[-1] if plot_files else None
-            self.app._result_queue.put(("complete", {"plot_path": plot_path}))
+            self.app._result_queue.put(("complete", {"plot_path": plot_path, "verdict": verdict}))
             return
 
         cal_fit = fit_circle(cal_meas)
         print_results(f"{part_id} (raw)", measurements, fit)
         print_results(f"{part_id} (calibrated)", cal_meas, cal_fit)
 
+        # Evaluate the calibrated (corrected) fit.
+        verdict = self._evaluate(recipe, cal_fit)
+
         _csv_path, png_path = save_combined_report(
             part_id, measurements, fit, cal_meas, cal_fit,
             b19, f25_nominal, cal_data, cal_file.name,
+            recipe=recipe, verdict=verdict,
         )
 
-        self.app._result_queue.put(("complete", {"plot_path": png_path}))
+        self.app._result_queue.put(("complete", {"plot_path": png_path, "verdict": verdict}))
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +1099,8 @@ class GasketInspectorApp:
 
         # Settings manager (no UI widget -- opens a dialog on demand)
         self.settings = SettingsManager(self.root)
+        # Recipe manager (product profiles: Cognex job + eval criteria)
+        self.recipes = RecipeManager(self.root, self)
 
         # Redirect stdout/stderr
         sys.stdout = RedirectStream(self._log_queue)
@@ -777,6 +1126,12 @@ class GasketInspectorApp:
         edit_menu = tk.Menu(menubar, tearoff=0)
         edit_menu.add_command(label="Settings...", command=self.settings.open_dialog)
         menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        # Recipe
+        recipe_menu = tk.Menu(menubar, tearoff=0)
+        recipe_menu.add_command(label="Select Recipe...", command=self.recipes.open_selector)
+        recipe_menu.add_command(label="Edit Recipes...", command=self.recipes.open_editor)
+        menubar.add_cascade(label="Recipe", menu=recipe_menu)
 
         # Help
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -841,6 +1196,7 @@ class GasketInspectorApp:
 
         self._stop_event.clear()
         self.status_bar.set(f"Running: {name}")
+        self.status_bar.set_verdict(None)
         self._set_buttons(running=True)
         self.plot_panel.clear()
 
@@ -865,9 +1221,15 @@ class GasketInspectorApp:
             while True:
                 msg_type, payload = self._result_queue.get_nowait()
                 if msg_type == "complete":
-                    self.status_bar.set("Complete")
+                    payload = payload or {}
+                    verdict = payload.get("verdict")
+                    if verdict is not None:
+                        self.status_bar.set("Complete")
+                        self.status_bar.set_verdict(verdict.passed)
+                    else:
+                        self.status_bar.set("Complete")
                     self._set_buttons(running=False)
-                    plot_path = payload.get("plot_path") if payload else None
+                    plot_path = payload.get("plot_path")
                     if plot_path:
                         self.plot_panel.display_png(Path(plot_path))
                     print("\n[GUI] Scan complete.\n")
