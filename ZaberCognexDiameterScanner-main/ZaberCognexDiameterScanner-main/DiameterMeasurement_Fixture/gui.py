@@ -235,13 +235,63 @@ class RecipeManager:
     def active_name(self) -> str | None:
         return self.active.name if self.active else None
 
-    def set_active(self, name: str | None):
+    def set_active(self, name: str | None, push_job: bool = True):
         self.active = self.recipes.get(name) if name else None
         self.app.status_bar.set_recipe(self.active_name())
         self.app.status_bar.set_verdict(None)
         self.app.diameter_tab.apply_recipe(self.active)
         if self.active:
             print(f"[Recipe] Active recipe: {self.active.name}")
+            if push_job and self.active.cognex_job:
+                self._push_job(self.active.cognex_job)
+
+    def _push_job(self, job_name):
+        """Load the recipe's job onto the Cognex now (short-lived connection).
+
+        Runs synchronously with a wait cursor, mirroring the FTP refresh. The
+        scan-start load in the Diameter tab remains as a safety net, so if this
+        is skipped (e.g. a scan is running) the correct job still loads at run.
+        """
+        if self.app._scan_thread and self.app._scan_thread.is_alive():
+            messagebox.showwarning(
+                "Recipe",
+                "A scan is running. The job will load at the next scan start.",
+            )
+            return
+
+        self.app.settings.apply_to_modules()
+        self._root.config(cursor="watch")
+        self._root.update_idletasks()
+
+        async def _run():
+            cognex = CognexConnection()
+            await cognex.connect()
+            try:
+                return await cognex.load_job(job_name)
+            finally:
+                await cognex.disconnect()
+
+        err = None
+        ok = False
+        try:
+            ok = asyncio.run(_run())
+        except Exception as e:  # noqa: BLE001 -- surface any hardware/telnet error
+            err = e
+        finally:
+            self._root.config(cursor="")
+
+        if err is not None:
+            messagebox.showerror(
+                "Cognex",
+                f"Could not load job '{job_name}' on the sensor:\n{type(err).__name__}: {err}",
+            )
+        elif ok:
+            self.app.status_bar.set(f"Loaded job: {job_name}")
+        else:
+            messagebox.showwarning(
+                "Cognex",
+                f"The sensor did not confirm loading '{job_name}'. See the log for details.",
+            )
 
     # -- Selector dialog --
 
@@ -283,6 +333,7 @@ class RecipeManager:
 
     def open_editor(self):
         dlg = self._make_dialog("Edit Recipes")
+        dlg.resizable(True, False)  # allow widening for long job/calibration names
         self._edit_jobs: list[str] = []
         self._edit_cal_files = find_calibration_files()
 
@@ -294,21 +345,23 @@ class RecipeManager:
         top = ttk.Frame(dlg, padding=12)
         top.pack(fill=tk.BOTH, expand=True)
 
+        # Widths sized so full job / calibration filenames are readable.
+        WIDE = 56
         # Recipe picker (existing names) + New
         ttk.Label(top, text="Recipe", anchor=tk.W).grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-        name_combo = ttk.Combobox(top, textvariable=name_var, width=24, values=sorted(self.recipes))
+        name_combo = ttk.Combobox(top, textvariable=name_var, width=WIDE, values=sorted(self.recipes))
         name_combo.grid(row=0, column=1, sticky=tk.EW, pady=2)
 
         # Cognex job (populated from FTP)
         ttk.Label(top, text="Cognex Job", anchor=tk.W).grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-        job_combo = ttk.Combobox(top, textvariable=job_var, width=24, state="readonly")
+        job_combo = ttk.Combobox(top, textvariable=job_var, width=WIDE, state="readonly")
         job_combo.grid(row=1, column=1, sticky=tk.EW, pady=2)
         ttk.Button(top, text="Refresh Jobs",
                    command=lambda: self._refresh_jobs(job_combo)).grid(row=1, column=2, padx=(6, 0))
 
         # Calibration file
         ttk.Label(top, text="Calibration File", anchor=tk.W).grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-        cal_combo = ttk.Combobox(top, textvariable=cal_var, width=24, state="readonly",
+        cal_combo = ttk.Combobox(top, textvariable=cal_var, width=WIDE, state="readonly",
                                  values=["(none)"] + [f.name for f in self._edit_cal_files])
         cal_combo.current(0)
         cal_combo.grid(row=2, column=1, sticky=tk.EW, pady=2)
@@ -316,7 +369,7 @@ class RecipeManager:
         # Remaining scalar fields
         for i, (key, label, _opt) in enumerate(self.EDITOR_FIELDS, start=3):
             ttk.Label(top, text=label, anchor=tk.W).grid(row=i, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-            ttk.Entry(top, textvariable=vars_[key], width=26).grid(row=i, column=1, sticky=tk.EW, pady=2)
+            ttk.Entry(top, textvariable=vars_[key], width=WIDE).grid(row=i, column=1, sticky=tk.EW, pady=2)
         top.columnconfigure(1, weight=1)
 
         def _load_selected(event=None):
@@ -358,7 +411,7 @@ class RecipeManager:
             recipe_store.save_recipes(self.recipes)
             name_combo["values"] = sorted(self.recipes)
             if self.active and self.active.name == r.name:
-                self.set_active(r.name)  # re-apply edited active recipe
+                self.set_active(r.name, push_job=False)  # re-apply config; no hardware load on save
             messagebox.showinfo("Recipe", f"Saved '{r.name}'.", parent=dlg)
 
         def _delete():

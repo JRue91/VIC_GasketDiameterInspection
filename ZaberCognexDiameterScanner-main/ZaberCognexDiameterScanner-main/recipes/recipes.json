@@ -1,0 +1,28 @@
+{
+  "JR_Test Recipe": {
+    "calibration_file": "calibration_Black_05052026-1_20260505_203959.csv",
+    "cognex_job": "DiameterGagingMachine_JR.jobx",
+    "diameter_cell": "B21",
+    "name": "JR_Test Recipe",
+    "nominal_diameter": 12.0,
+    "num_rotations": 1,
+    "repeatability_limit": null,
+    "rms_limit": null,
+    "step_deg": 2,
+    "tol_minus": 0.125,
+    "tol_plus": 0.125
+  },
+  "Test_Switch Recipe": {
+    "calibration_file": "calibration_Black_05052026-1_20260505_203959.csv",
+    "cognex_job": "12innewss.jobx",
+    "diameter_cell": "B21",
+    "name": "Test_Switch Recipe",
+    "nominal_diameter": 12.0,
+    "num_rotations": 1,
+    "repeatability_limit": null,
+    "rms_limit": null,
+    "step_deg": 5,
+    "tol_minus": 0.25,
+    "tol_plus": 0.25
+  }
+}

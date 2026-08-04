@@ -190,20 +190,60 @@ class CognexConnection:
             return txt
         return ""
 
-    async def get_job(self):
-        """Return the filename of the currently loaded job (Native Mode GF)."""
-        resp = await self._command("GF")
-        print(f"[Cognex] Current job: '{resp}'")
-        return resp
+    @staticmethod
+    def _is_status_code(txt):
+        """True if txt is a bare Native Mode status code (e.g. '1', '0', '-1')."""
+        return txt.lstrip("-").isdigit()
 
-    async def load_job(self, job_name, settle=1.5):
+    async def get_job(self):
+        """Return the filename of the currently loaded job (Native Mode GF).
+
+        GF replies with a status-code line ('1' on success) FOLLOWED by the
+        filename on the next line, so skip the leading status code and return
+        the first non-status line as the name.
+        """
+        self.writer.write("GF\r\n")
+        await self.writer.drain()
+
+        name, status = "", None
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                line = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
+            except asyncio.TimeoutError:
+                if status is not None:  # got status, name isn't coming
+                    break
+                continue
+            if not line:
+                continue
+            txt = line.strip()
+            if not txt or txt == "GF" or txt == '>':
+                continue
+            if self._is_status_code(txt):
+                # First status code is the GF result; any later status code
+                # (e.g. '-5' emitted mid-load) is NOT a filename -- skip it.
+                if status is None:
+                    status = txt
+                continue
+            name = txt
+            break
+
+        print(f"[Cognex] Current job: '{name}' (status {status})")
+        return name
+
+    async def load_job(self, job_name, settle=1.0, verify_timeout=12.0):
         """Load a Cognex job by filename via Native Mode.
 
-        Sequence: SO0 (offline) -> LF<job> (load) -> SO1 (online) -> GF (verify).
-        In-Sight file commands return '1' on success. Firmware differs on whether
-        LF wants the extension, so this tries the name as given and then the
-        extension-stripped stem (e.g. "part.jobx" then "part"). Returns True only
-        if the loaded job verifies; leaves the sensor online on failure.
+        Sequence: SO0 (offline) -> LF<job> (load) -> poll GF until the job
+        confirms -> SO1 (online). In-Sight file commands return '1' on success.
+        Firmware differs on whether LF wants the extension, so this tries the
+        name as given and then the extension-stripped stem (e.g. "part.jobx"
+        then "part").
+
+        Loading a job makes the sensor emit delayed output, so rather than
+        trusting one exactly-timed GF, confirm by polling GF (draining stale
+        chatter between reads) until it reports the loaded job or the timeout
+        elapses. Returns True only if the loaded job verifies.
         """
         # Candidate LF arguments: full name first, then the bare stem.
         stem = job_name.rsplit(".", 1)[0] if "." in job_name else job_name
@@ -213,12 +253,14 @@ class CognexConnection:
 
         print(f"[Cognex] Loading job '{job_name}'...")
 
+        await self._drain(0.3)  # clear any pending output before we start
         off = await self._command("SO0")
         if not off.startswith("1"):
             print(f"[Cognex] ! SO0 (offline) returned '{off}'")
 
         loaded = None
         for cand in candidates:
+            await self._drain(0.2)
             resp = await self._command(f"LF{cand}")
             if resp.startswith("1"):
                 loaded = cand
@@ -231,21 +273,35 @@ class CognexConnection:
             await self._command("SO1")  # restore online state before bailing
             return False
 
-        # Give the job time to compile/initialize before going online.
+        # Poll GF until the job finishes loading and confirms (the sensor may
+        # return error/empty while still compiling a large job).
         await asyncio.sleep(settle)
+        ok = False
+        deadline = asyncio.get_event_loop().time() + verify_timeout
+        while asyncio.get_event_loop().time() < deadline:
+            await self._drain(0.3)  # flush load-time chatter before the query
+            current = await self.get_job()
+            if current and stem.lower() in current.lower():
+                ok = True
+                break
+            await asyncio.sleep(0.5)
 
-        on = await self._command("SO1")
-        if not on.startswith("1"):
-            print(f"[Cognex] ! SO1 (online) returned '{on}'")
+        # Bring the sensor back online (best-effort, retried; drain first so we
+        # read SO1's own reply and not leftover load output).
+        for _ in range(3):
+            await self._drain(0.2)
+            on = await self._command("SO1")
+            if on.startswith("1"):
+                break
+            print(f"[Cognex] ! SO1 (online) returned '{on}', retrying...")
+            await asyncio.sleep(0.3)
         await asyncio.sleep(0.2)
 
-        current = await self.get_job()
-        # Verify against the bare stem so a with/without-extension GF reply matches.
-        ok = bool(current) and stem.lower() in current.lower()
         if ok:
             print(f"[Cognex] Job '{job_name}' loaded and online.")
         else:
-            print(f"[Cognex] ! Job verify mismatch: expected '{stem}', got '{current}'")
+            print(f"[Cognex] ! Job load not confirmed within {verify_timeout:.0f}s "
+                  f"(expected '{stem}').")
         return ok
 
     async def _drain(self, timeout):
