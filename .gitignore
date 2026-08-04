@@ -1,4 +1,5 @@
 *.dwl
 *.dwl2
+*_recover.dwg
 __pycache__/
 .vscode/
