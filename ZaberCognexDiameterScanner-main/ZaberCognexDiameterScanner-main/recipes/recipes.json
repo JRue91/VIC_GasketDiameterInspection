@@ -4,7 +4,7 @@
     "cognex_job": "DiameterGagingMachine_JR.jobx",
     "diameter_cell": "B21",
     "name": "JR_Test Recipe",
-    "nominal_diameter": 12.0,
+    "nominal_diameter": 14.0,
     "num_rotations": 1,
     "repeatability_limit": null,
     "rms_limit": null,
