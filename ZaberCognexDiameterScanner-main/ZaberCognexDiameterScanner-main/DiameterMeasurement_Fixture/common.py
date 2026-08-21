@@ -41,6 +41,20 @@ COGNEX_PASS = ""
 COGNEX_MAX_RETRIES = 5
 COGNEX_FTP_PORT = 21
 
+# Trigger mode. In-Sight only accepts the "MT" manual trigger while the sensor
+# is Offline, which takes it out of its normal run state for the whole scan.
+# "online" instead leaves the sensor Online (SO1) and fires the soft-event
+# trigger SW8, so the sensor keeps running its job the way it does in
+# production. "offline" preserves the original SO0 + MT behaviour.
+COGNEX_TRIGGER_MODE = "online"      # "online" (SO1 + SW8) or "offline" (SO0 + MT)
+COGNEX_ONLINE_TRIGGER = "SW8"       # soft event used in online mode
+COGNEX_OFFLINE_TRIGGER = "MT"       # manual trigger used in offline mode
+
+# Refuse to start a scan unless the sensor reports a loaded job. A sensor with
+# no job returns garbage or nothing for the measurement cells, so this turns a
+# confusing mid-scan failure into a clear pre-flight error.
+COGNEX_REQUIRE_JOB = True
+
 try:
     import telnetlib3
 except:
@@ -93,13 +107,62 @@ class CognexConnection:
         print("[Cognex] Disconnected")
 
     async def trigger(self):
-        """Send trigger and wait for acknowledgment."""
+        """Fire one acquisition using whichever trigger the mode calls for.
+
+        Online mode sends the SW8 soft event, which In-Sight accepts only while
+        the sensor is Online and the job's acquisition trigger is set to Manual
+        or Network. It answers '1' on success and a negative status code on
+        failure, so this path is strict: anything else raises RuntimeError and
+        lets trigger_and_read() retry. Offline mode keeps the original lenient
+        MT handling, whose reply varies by firmware.
+        """
+        if COGNEX_TRIGGER_MODE == "online":
+            await self._trigger_online()
+        else:
+            await self._trigger_offline()
+
+    async def _trigger_online(self):
+        """SW8 soft-event trigger; the sensor stays Online."""
         t_start = time.time()
-        print(f"      -> Sending MT command...")
-        self.writer.write("MT\r\n")
+        cmd = COGNEX_ONLINE_TRIGGER
+        self.writer.write(f"{cmd}\r\n")
+        await self.writer.drain()
+
+        deadline = asyncio.get_event_loop().time() + 5.0
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                line = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+            if not line:
+                continue
+            txt = line.strip()
+            if not txt or txt == cmd or txt == '>':
+                continue
+            if not self._is_status_code(txt):
+                # Output the running job pushed on its own -- not our reply.
+                continue
+            if txt == '1':
+                print(f"      -> {cmd} ack ({(time.time()-t_start)*1000:.1f}ms)")
+                await asyncio.sleep(0.05)
+                return
+            raise RuntimeError(
+                f"{cmd} trigger rejected (status {txt}). The sensor must be "
+                f"Online with the job's acquisition trigger set to Manual or "
+                f"Network."
+            )
+
+        raise RuntimeError(f"No acknowledgment for {cmd} trigger within 5s")
+
+    async def _trigger_offline(self):
+        """MT manual trigger; requires the sensor to be Offline."""
+        t_start = time.time()
+        cmd = COGNEX_OFFLINE_TRIGGER
+        print(f"      -> Sending {cmd} command...")
+        self.writer.write(f"{cmd}\r\n")
         await self.writer.drain()
         t_sent = time.time()
-        print(f"      -> MT sent ({(t_sent-t_start)*1000:.1f}ms)")
+        print(f"      -> {cmd} sent ({(t_sent-t_start)*1000:.1f}ms)")
 
         print(f"      -> Waiting for acknowledgment...")
         deadline = asyncio.get_event_loop().time() + 5.0
@@ -303,6 +366,73 @@ class CognexConnection:
             print(f"[Cognex] ! Job load not confirmed within {verify_timeout:.0f}s "
                   f"(expected '{stem}').")
         return ok
+
+    async def set_online(self, online=True, retries=3):
+        """Put the sensor Online (SO1) or Offline (SO0).
+
+        Retried because the sensor can be busy right after a job load and
+        answer with an error status. Returns True once the command is acked.
+        """
+        want = 1 if online else 0
+        label = "Online" if online else "Offline"
+        for _ in range(retries):
+            await self._drain(0.2)
+            resp = await self._command(f"SO{want}")
+            if resp.startswith("1"):
+                print(f"[Cognex] Sensor {label}")
+                return True
+            print(f"[Cognex] ! SO{want} returned '{resp}', retrying...")
+            await asyncio.sleep(0.3)
+        return False
+
+    async def ensure_job_loaded(self, expected_job=None):
+        """Confirm a job is loaded, raising RuntimeError if not.
+
+        With no job the measurement cells hold stale or empty values, so a scan
+        would silently produce garbage. Returns the loaded job's filename. When
+        `expected_job` is given the loaded job must match it, compared on the
+        extension-stripped stem because GF's spelling of the name varies.
+        """
+        await self._drain(0.3)  # don't mistake job output for the GF reply
+        name = await self.get_job()
+        if not name:
+            raise RuntimeError(
+                "No job is loaded on the Cognex. Load a job on the sensor, or "
+                "select a recipe that specifies one, before running a scan."
+            )
+        if expected_job:
+            stem = expected_job.rsplit(".", 1)[0] if "." in expected_job else expected_job
+            if stem.lower() not in name.lower():
+                raise RuntimeError(
+                    f"Cognex has job '{name}' loaded, but '{expected_job}' was "
+                    f"expected. Re-select the recipe to load the correct job."
+                )
+        return name
+
+    async def prepare_for_scan(self, expected_job=None):
+        """Put the sensor in the run state this trigger mode needs, then check
+        that a job is loaded.
+
+        Online mode leaves the sensor running its job (SO1) so measurements are
+        taken under the same conditions as production; offline mode drops it to
+        SO0 so the MT manual trigger is accepted. Returns the loaded job name,
+        or None when COGNEX_REQUIRE_JOB is off.
+        """
+        online = COGNEX_TRIGGER_MODE == "online"
+        print(f"[Cognex] Trigger mode: {COGNEX_TRIGGER_MODE} "
+              f"({COGNEX_ONLINE_TRIGGER if online else COGNEX_OFFLINE_TRIGGER})")
+
+        if not await self.set_online(online):
+            raise RuntimeError(
+                f"Could not put the Cognex {'Online' if online else 'Offline'} "
+                f"(SO{1 if online else 0} was not acknowledged)."
+            )
+
+        if not COGNEX_REQUIRE_JOB:
+            return None
+        job = await self.ensure_job_loaded(expected_job)
+        print(f"[Cognex] Job '{job}' is loaded -- ready to scan.")
+        return job
 
     async def _drain(self, timeout):
         deadline = asyncio.get_event_loop().time() + timeout

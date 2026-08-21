@@ -85,6 +85,7 @@ class SettingsManager:
         "cognex_user": "admin", "cognex_pass": "",
         "cognex_retries": "5",
         "diameter_cell": "B21", "calibration_cell": "F25",
+        "cognex_trigger_mode": "online", "cognex_require_job": "1",
     }
 
     def __init__(self, root: tk.Tk):
@@ -104,6 +105,9 @@ class SettingsManager:
         self._vars["cognex_retries"] = tk.StringVar(value=str(common.COGNEX_MAX_RETRIES))
         self._vars["diameter_cell"] = tk.StringVar(value="B21")
         self._vars["calibration_cell"] = tk.StringVar(value="F25")
+        self._vars["cognex_trigger_mode"] = tk.StringVar(value=common.COGNEX_TRIGGER_MODE)
+        self._vars["cognex_require_job"] = tk.StringVar(
+            value="1" if common.COGNEX_REQUIRE_JOB else "0")
 
     # -- Public helpers (used by tabs / scan threads) --
 
@@ -126,6 +130,8 @@ class SettingsManager:
         common.COGNEX_USER = self.get("cognex_user")
         common.COGNEX_PASS = self.get("cognex_pass")
         common.COGNEX_MAX_RETRIES = self.get_int("cognex_retries")
+        common.COGNEX_TRIGGER_MODE = self.get("cognex_trigger_mode")
+        common.COGNEX_REQUIRE_JOB = self.get("cognex_require_job") == "1"
         DiameterScan.COGNEX_CELL = self.get("diameter_cell")
         CalibrationScan.CALIBRATION_CELL = self.get("calibration_cell")
 
@@ -175,6 +181,30 @@ class SettingsManager:
         )
         self._dialog_field(cognex_frame, "Diameter Cell", "diameter_cell", 7)
         self._dialog_field(cognex_frame, "Calibration Cell", "calibration_cell", 8)
+
+        ttk.Separator(cognex_frame, orient=tk.HORIZONTAL).grid(
+            row=9, column=0, columnspan=2, sticky="ew", pady=6,
+        )
+        ttk.Label(cognex_frame, text="Triggering", font=("Segoe UI", 8, "italic")).grid(
+            row=10, column=0, columnspan=2, sticky=tk.W,
+        )
+        ttk.Label(cognex_frame, text="Trigger Mode", anchor=tk.W).grid(
+            row=11, column=0, sticky=tk.W, padx=(0, 8), pady=2,
+        )
+        ttk.Combobox(
+            cognex_frame, textvariable=self._vars["cognex_trigger_mode"],
+            values=["online", "offline"], state="readonly", width=18,
+        ).grid(row=11, column=1, sticky=tk.EW, pady=2)
+        ttk.Label(
+            cognex_frame,
+            text="online = sensor stays running, SW8 soft trigger\n"
+                 "offline = sensor taken offline, MT manual trigger",
+            font=("Segoe UI", 7), foreground="#555", justify=tk.LEFT,
+        ).grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        ttk.Checkbutton(
+            cognex_frame, text="Require a loaded job before scanning",
+            variable=self._vars["cognex_require_job"], onvalue="1", offvalue="0",
+        ).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=2)
 
         # --- Buttons ---
         btn_frame = ttk.Frame(dlg)
@@ -810,6 +840,9 @@ class DiameterScanTab(ttk.Frame):
                             raise RuntimeError(
                                 f"Failed to load Cognex job '{recipe.cognex_job}' for recipe '{recipe.name}'."
                             )
+                    await cognex.prepare_for_scan(
+                        recipe.cognex_job if recipe is not None else None
+                    )
                     b19_value = None
                     if cal_data is not None:
                         b19_value = await cognex.read_cell("B19")
@@ -968,6 +1001,7 @@ class CalibrationScanTab(ttk.Frame):
                 cognex = CognexConnection()
                 await cognex.connect()
                 try:
+                    await cognex.prepare_for_scan()
                     return await calibration_scan(axis, cognex, step_deg,
                                                   speed, accel, dwell,
                                                   stop_event=stop_event)
@@ -1095,6 +1129,7 @@ class CalibrationVerifyTab(ttk.Frame):
                 cognex = CognexConnection()
                 await cognex.connect()
                 try:
+                    await cognex.prepare_for_scan()
                     runs = []
                     for i in range(num_runs):
                         if stop_event.is_set():

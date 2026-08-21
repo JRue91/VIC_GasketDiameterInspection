@@ -13,6 +13,8 @@ diameter and surface profile.
   - `CalibrationScan.py` — 0–359° surface map, writes calibration CSV
   - `CalibrationVerify.py` — re-scans against a stored calibration, writes
     a multi-run report (PNG + CSV)
+  - `test_cognex_trigger.py` — hardware-free checks of the trigger modes and
+    the job gate, against a stub In-Sight responder (`python test_cognex_trigger.py`)
 - `ZaberCognexDiameterScanner-main/ZaberCognexDiameterScanner-main/calibration/` — calibration CSVs and `plots/` for verify reports
 - `ZaberCognexDiameterScanner-main/ZaberCognexDiameterScanner-main/data/` — diameter scan CSVs
 - `ZaberCognexDiameterScanner-main/ZaberCognexDiameterScanner-main/plots/` — diameter scan plots
@@ -43,8 +45,29 @@ Individual modules can also be run directly from the same folder for CLI use
   password). Cells: `B21` for diameter scans (radius reading from rotation
   axis, doubled by `fit_circle()` to report diameter), `F25` for calibration
   (scanner-to-surface distance), `B19` for the calibrated diameter (read
-  live as metadata when applying calibration). `MT` triggers a measurement;
-  `GV<cell>` reads the value (no trigger needed for stored cells like B19).
+  live as metadata when applying calibration). `GV<cell>` reads the value (no
+  trigger needed for stored cells like B19).
+
+### Trigger mode (`common.COGNEX_TRIGGER_MODE`)
+
+- **`online`** (default) — the sensor stays Online (`SO1`) running its job, and
+  each measurement is fired with the `SW8` soft event. This is the production
+  run state. The job's Acquire trigger must be set to **Manual** or **Network**
+  or the sensor rejects `SW8` with a negative status.
+- **`offline`** — the original behaviour: the sensor is taken Offline (`SO0`)
+  and each measurement is fired with `MT`.
+
+### Job gate (`common.COGNEX_REQUIRE_JOB`)
+
+On by default: a scan will not start unless `GF` reports a loaded job, since a
+jobless sensor returns stale or empty cells and the scan would silently produce
+garbage. When a recipe is active, the loaded job must also match the recipe's
+`cognex_job` (compared on the extension-stripped stem). Both failures raise
+before any motion, and the GUI shows them as an error dialog.
+
+`CognexConnection.prepare_for_scan()` applies the trigger mode and runs the job
+gate; all three scan tabs call it right after connecting. Both are switchable at
+runtime in Edit → Settings… → Cognex IL38 → Triggering.
 
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
