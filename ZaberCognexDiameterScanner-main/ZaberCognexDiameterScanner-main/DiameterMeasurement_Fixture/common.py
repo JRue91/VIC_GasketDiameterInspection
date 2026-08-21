@@ -488,10 +488,11 @@ class CognexConnection:
             raise RuntimeError(
                 f"The Cognex refused to go {want} "
                 f"(SO{1 if online else 0} -> '{self._last_online_reply}'). "
-                f"A connected In-Sight Explorer / EasyBuilder session owns the "
-                f"Online state and will block the change -- close it and retry. "
-                f"If the sensor will not go {want} by hand either, this is not "
-                f"a telnet problem. Trigger Mode 'offline' avoids needing SO1."
+                f"Cognex documents that Set Online cannot bring the sensor "
+                f"Online if it was set Offline manually in In-Sight Explorer or "
+                f"by a Discrete Input; that latch is only clearable the same "
+                f"way. Set the sensor Online in In-Sight Explorer and retry. "
+                f"Trigger Mode 'offline' avoids needing SO1 at all."
             )
 
         if not COGNEX_REQUIRE_JOB:

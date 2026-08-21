@@ -96,6 +96,12 @@ Status-code meanings beyond `0` (unrecognised command) vary by firmware, so the
 code does not try to interpret them — it reports the raw code and defers to the
 probe.
 
+**`SO1` returning a negative status:** Cognex documents that Set Online cannot
+bring the sensor Online if it was set Offline *manually in In-Sight Explorer* or
+*by a Discrete Input*. Native Mode cannot clear that latch — only the same route
+that set it can. If `SO1` is refused, set the sensor Online in In-Sight Explorer.
+Online trigger mode depends on `SO1`; `offline` mode does not.
+
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
 before each scan starts.
