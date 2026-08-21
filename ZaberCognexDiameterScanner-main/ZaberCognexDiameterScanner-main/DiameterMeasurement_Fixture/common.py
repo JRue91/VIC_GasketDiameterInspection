@@ -449,6 +449,22 @@ class CognexConnection:
             await asyncio.sleep(0.3)
         return False
 
+    async def get_online(self):
+        """Return True if the sensor is Online, False if Offline, None if unknown.
+
+        Native Mode 'GO' (Get Online) answers '1' Online and '0' Offline. Note
+        the ambiguity: '0' is also the generic "unrecognised command" reply, so
+        on firmware without GO this reports Offline rather than unknown. Treat
+        a False as "probably Offline" and let the trigger confirm.
+        """
+        await self._drain(0.2)
+        resp = await self._command("GO")
+        if resp == "1":
+            return True
+        if resp == "0":
+            return False
+        return None
+
     async def ensure_job_loaded(self, expected_job=None):
         """Confirm a job is loaded, raising RuntimeError if not.
 
@@ -506,6 +522,25 @@ class CognexConnection:
                   f"set Offline by hand in Explorer or by a Discrete Input; "
                   f"that latch clears only the same way.")
         else:
+            self._state_uncertain = ""
+
+        # SO's ack only says the command was accepted. GO reports the state
+        # itself, so use it to catch a sensor that is genuinely in the wrong
+        # one before the scan starts moving.
+        actual = await self.get_online()
+        if actual is not None and actual != online:
+            is_now = "Online" if actual else "Offline"
+            want = "Online" if online else "Offline"
+            raise RuntimeError(
+                f"The Cognex is {is_now} but this trigger mode needs it "
+                f"{want} (GO -> {'1' if actual else '0'}). "
+                f"In-Sight refuses Set Online when the sensor was set Offline "
+                f"by hand in In-Sight Explorer or by a Discrete Input; that "
+                f"latch clears only the same way. Set it {want} in Explorer, "
+                f"or use Trigger Mode "
+                f"'{'offline' if actual else 'online'}' to match how it is now."
+            )
+        if actual is not None:
             self._state_uncertain = ""
 
         if not COGNEX_REQUIRE_JOB:

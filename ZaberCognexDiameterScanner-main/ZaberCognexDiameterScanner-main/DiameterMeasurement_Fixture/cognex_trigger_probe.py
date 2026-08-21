@@ -102,7 +102,8 @@ async def main(cell, host, counter_cell):
         print("\n[1] Context")
         for cmd in CONTEXT:
             print(f"  {cmd:<6} -> {await collect(conn, cmd)}")
-        print("      (a '0' reply just means this firmware has no such command)")
+        print("      (GO is Get Online: 1 = Online, 0 = Offline. For the others")
+        print("       a '0' reply means this firmware has no such command.)")
 
         print("\n[2] Sensor Online (SO1)")
         so1 = await collect(conn, "SO1")
@@ -173,11 +174,34 @@ async def main(cell, host, counter_cell):
             print("  known-good offline MT. Check that it really is an acquisition")
             print("  counter, and that the job is running.")
     elif acked:
-        best = acked[0]["cmd"]
-        print(f"  {best} was accepted (status 1) but no acquisition registered,")
-        print("  while the offline MT control did. The command is valid and the")
-        print("  job is not acquiring on it -- check the AcquireImage Trigger")
-        print("  setting in the job (Manual or Network; not Continuous/External).")
+        primary = next((r for r in online_results
+                        if r["cmd"] == common.COGNEX_ONLINE_TRIGGER), None)
+        others = [r for r in acked if r is not primary]
+
+        print("  No candidate acquired while Online, but the offline MT control")
+        print("  did -- so the sensor and cell are fine and this is specific to")
+        print("  triggering in Online mode.")
+
+        if primary is not None and primary["status"] != "1":
+            print(f"\n  {primary['cmd']} was REFUSED (status {primary['status']}).")
+            if others:
+                accepted = ", ".join(r["cmd"] for r in others)
+                print(f"  {accepted} was accepted (status 1) but acquired nothing,")
+                print("  which means the command family is understood by the")
+                print(f"  sensor and {primary['cmd']} specifically is being rejected.")
+                print("  Those other events are not acquisition triggers, so their")
+                print("  status 1 is not a working trigger -- do not switch to one.")
+            print("\n  That localises the fault to the job, not the protocol:")
+            print("  soft event 8 is only accepted when the job's AcquireImage")
+            print("  Trigger is set to Manual or Network. Continuous, External and")
+            print("  Camera all refuse it.")
+            print("\n  Fix in In-Sight Explorer: open the job, set the AcquireImage")
+            print("  Trigger to Manual (or Network), save the job, then re-run.")
+        else:
+            best = acked[0]["cmd"]
+            print(f"\n  {best} was accepted (status 1) but acquired nothing.")
+            print("  The command is valid and the job is not acquiring on it --")
+            print("  check the AcquireImage Trigger setting in the job.")
     else:
         codes = sorted({r["status"] for r in online_results})
         print(f"  No candidate triggered while Online. Status codes seen: {codes}")

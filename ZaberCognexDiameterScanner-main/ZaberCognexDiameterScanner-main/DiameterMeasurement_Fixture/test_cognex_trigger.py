@@ -40,6 +40,9 @@ class FakeSensor:
         elif cmd == "SO0":
             self.online = False
             self.out.append("1")
+        elif cmd == "GO":
+            # Get Online: 1 = Online, 0 = Offline (not "unrecognised").
+            self.out.append("1" if self.online else "0")
         elif cmd == "GF":
             self.out.append("1")
             if self.job:
@@ -210,20 +213,39 @@ async def main():
     check("returns None when gate off", job is None, repr(job))
     common.COGNEX_REQUIRE_JOB = True
 
-    print("\n== a refused SO1 warns but does not block the scan ==")
-    # Native Mode cannot query Online state, so a refused SO1 might simply mean
-    # the sensor is already Online. Carrying on is correct; the trigger is the
-    # real test.
+    print("\n== refused SO1 but GO confirms Online: scan proceeds ==")
+    # Native Mode refuses Set Online when the sensor was put Offline by hand,
+    # but a refusal can also just mean it is already Online. GO settles it.
     s = FakeSensor(online=True)
     real_handle = s.handle
     s.handle = lambda cmd: s.out.append("-5") if cmd == "SO1" else real_handle(cmd)
     job = await make_conn(s).prepare_for_scan()
-    check("scan is not blocked by a refused SO1", job == "gasket_14in.job", repr(job))
+    check("not blocked when GO says Online", job == "gasket_14in.job", repr(job))
 
-    print("\n== a refused SO1 is recalled in the trigger error ==")
-    s = FakeSensor(online=True, sw8_status="-2")
+    print("\n== GO says Offline while online mode needs Online: clear error ==")
+    s = FakeSensor(online=False)
     real_handle = s.handle
     s.handle = lambda cmd: s.out.append("-5") if cmd == "SO1" else real_handle(cmd)
+    try:
+        await make_conn(s).prepare_for_scan()
+        check("wrong state fails pre-flight", False, "no exception")
+    except RuntimeError as e:
+        check("wrong state fails pre-flight", "is Offline but this trigger mode" in str(e), str(e))
+        check("names the Explorer latch", "In-Sight Explorer" in str(e), str(e))
+
+    print("\n== SO1 refused and GO unavailable: uncertainty is recalled ==")
+    s = FakeSensor(online=True, sw8_status="-2")
+    real_handle = s.handle
+
+    def no_go(cmd):
+        if cmd == "SO1":
+            s.out.append("-5")
+        elif cmd == "GO":
+            s.out.append("-1")        # neither 1 nor 0 -> state unknown
+        else:
+            real_handle(cmd)
+
+    s.handle = no_go
     c = make_conn(s)
     await c.prepare_for_scan()
     try:

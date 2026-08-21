@@ -100,7 +100,19 @@ probe.
 bring the sensor Online if it was set Offline *manually in In-Sight Explorer* or
 *by a Discrete Input*. Native Mode cannot clear that latch — only the same route
 that set it can. If `SO1` is refused, set the sensor Online in In-Sight Explorer.
-Online trigger mode depends on `SO1`; `offline` mode does not.
+Online trigger mode depends on the sensor being Online; `offline` mode does not.
+
+A refused `SO1` is not treated as fatal on its own, because it also happens when
+the sensor is *already* Online. `GO` (Get Online) is the authority: it answers
+`1` Online and `0` Offline, and `prepare_for_scan()` fails the run only when `GO`
+actually contradicts the mode.
+
+**`SW8` returning `-2` while Online:** soft event 8 is only accepted when the
+job's **AcquireImage Trigger is Manual or Network**. Continuous, External and
+Camera refuse it. A neighbouring event such as `SW7` answering `1` does not
+contradict this — those events are not acquisition triggers, so their success
+says the command family parses, not that triggering works. This is a job-side
+fix in In-Sight Explorer, not a code change.
 
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
