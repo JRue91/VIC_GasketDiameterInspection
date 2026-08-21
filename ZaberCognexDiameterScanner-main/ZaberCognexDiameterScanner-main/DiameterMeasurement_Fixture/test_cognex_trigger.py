@@ -150,8 +150,8 @@ async def main():
         await c._trigger_online()
         check("status -1 names the job-trigger case", False, "no exception")
     except RuntimeError as e:
-        check("status -1 names the job-trigger case",
-              "refused" in str(e) and "Manual or Network" in str(e), str(e))
+        check("status -1 lists causes without asserting one",
+              "refused" in str(e) and "cognex_trigger_probe" in str(e), str(e))
 
     print("\n== silent sensor reports the timeout ==")
     s = FakeSensor(online=True, sw8_status=None)

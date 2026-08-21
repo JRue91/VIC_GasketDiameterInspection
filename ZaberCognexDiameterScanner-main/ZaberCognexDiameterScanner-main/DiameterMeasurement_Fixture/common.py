@@ -180,10 +180,18 @@ class CognexConnection:
                 f"Trigger Mode to 'offline' to go back to SO0 + MT.{detail}"
             )
         if bad_status is not None:
+            # Deliberately does not claim to know what this status means. Only
+            # 0 (unrecognised command) is reliably documented across In-Sight
+            # firmware; the rest vary, so list the causes worth ruling out and
+            # point at the probe instead of asserting one.
             raise RuntimeError(
-                f"{cmd} trigger refused (status {bad_status}) after {waited:.1f}s. "
-                f"The sensor must be Online with the job's acquisition trigger "
-                f"set to Manual or Network.{detail}"
+                f"{cmd} was refused by the sensor (status {bad_status}) after "
+                f"{waited:.1f}s.{detail} Causes worth ruling out: In-Sight "
+                f"Explorer is connected and holding Full Access; the job's "
+                f"AcquireImage Trigger is not Manual/Network; the telnet user "
+                f"lacks Full Access. Run cognex_trigger_probe.py to find which "
+                f"trigger this sensor accepts, or set Trigger Mode to 'offline' "
+                f"to fall back to SO0 + MT."
             )
         raise RuntimeError(
             f"No acknowledgment for {cmd} within {COGNEX_TRIGGER_TIMEOUT_S:.1f}s."

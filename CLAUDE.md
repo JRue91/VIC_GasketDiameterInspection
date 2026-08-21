@@ -83,6 +83,19 @@ trigger and cell reads, since the Native Mode reply that matters is often a bare
 status code the parsers skip. `trigger_and_read()` prints the real error on each
 attempt and chains the last one into its final exception.
 
+`cognex_trigger_probe.py` fires each candidate trigger at the sensor and reports
+the raw reply plus whether the measurement cell actually changed — a command can
+answer `1` without acquiring anything. It touches only the Cognex (no stage
+motion, no job load/save):
+
+```powershell
+python cognex_trigger_probe.py --cell B21
+```
+
+Status-code meanings beyond `0` (unrecognised command) vary by firmware, so the
+code does not try to interpret them — it reports the raw code and defers to the
+probe.
+
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
 before each scan starts.
