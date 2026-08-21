@@ -108,11 +108,24 @@ the sensor is *already* Online. `GO` (Get Online) is the authority: it answers
 actually contradicts the mode.
 
 **`SW8` returning `-2` while Online:** soft event 8 is only accepted when the
-job's **AcquireImage Trigger is Manual or Network**. Continuous, External and
-Camera refuse it. A neighbouring event such as `SW7` answering `1` does not
-contradict this — those events are not acquisition triggers, so their success
-says the command family parses, not that triggering works. This is a job-side
-fix in In-Sight Explorer, not a code change.
+job's acquisition trigger source is a *software* trigger:
+
+| Editor | Setting | Works with `SW8` |
+| --- | --- | --- |
+| In-Sight Vision Suite (this rig) | Trigger Source = **Software** | yes |
+| In-Sight Vision Suite | Trigger Source = Input Line | no — returns `-2` |
+| In-Sight Explorer | Trigger = Manual / Network | yes |
+| In-Sight Explorer | Trigger = Continuous / External / Camera | no |
+
+An Input Line source waits on a hardware edge that never arrives on this rig,
+which also shows up as an acquisition counter that never advances on its own
+while Online. This is a job-side fix in the editor, not a code change.
+
+A neighbouring event such as `SW7` answering `1` does not contradict any of
+this — those events are not acquisition triggers, so their success only means
+the command family parses. Confirmed on this rig: with Trigger Source =
+Software, `SW8` returns `1` and the acquisition counter increments, while `SW7`
+returns `1` and it does not.
 
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
