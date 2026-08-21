@@ -210,15 +210,28 @@ async def main():
     check("returns None when gate off", job is None, repr(job))
     common.COGNEX_REQUIRE_JOB = True
 
-    print("\n== a refused SO1 is reported with its status ==")
-    s = FakeSensor(online=False)
-    s.handle = lambda cmd: (s.sent.append(cmd), s.out.append("-5"))[0]
+    print("\n== a refused SO1 warns but does not block the scan ==")
+    # Native Mode cannot query Online state, so a refused SO1 might simply mean
+    # the sensor is already Online. Carrying on is correct; the trigger is the
+    # real test.
+    s = FakeSensor(online=True)
+    real_handle = s.handle
+    s.handle = lambda cmd: s.out.append("-5") if cmd == "SO1" else real_handle(cmd)
+    job = await make_conn(s).prepare_for_scan()
+    check("scan is not blocked by a refused SO1", job == "gasket_14in.job", repr(job))
+
+    print("\n== a refused SO1 is recalled in the trigger error ==")
+    s = FakeSensor(online=True, sw8_status="-2")
+    real_handle = s.handle
+    s.handle = lambda cmd: s.out.append("-5") if cmd == "SO1" else real_handle(cmd)
+    c = make_conn(s)
+    await c.prepare_for_scan()
     try:
-        await make_conn(s).prepare_for_scan()
-        check("SO1 refusal surfaces", False, "no exception")
+        await c._trigger_online()
+        check("trigger error recalls the refused SO1", False, "no exception")
     except RuntimeError as e:
-        check("SO1 refusal surfaces", "refused to go Online" in str(e), str(e))
-        check("SO1 refusal quotes the status", "-5" in str(e), str(e))
+        check("trigger error recalls the refused SO1",
+              "SO1 was refused" in str(e) and "-5" in str(e), str(e))
 
     print("\n== offline mode still works (regression) ==")
     common.COGNEX_TRIGGER_MODE = "offline"

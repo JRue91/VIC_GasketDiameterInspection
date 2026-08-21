@@ -83,6 +83,7 @@ class CognexConnection:
         self.writer = None
         self._connected = False
         self._last_online_reply = ""   # raw reply to the most recent SO0/SO1
+        self._state_uncertain = ""     # set when SO0/SO1 was refused
 
     async def connect(self):
         if self._connected:
@@ -173,6 +174,8 @@ class CognexConnection:
 
         waited = time.time() - t_start
         detail = f" Sensor sent: {seen}." if seen else " Sensor sent nothing."
+        if self._state_uncertain:
+            detail += f" Note: {self._state_uncertain}."
         if bad_status == "0":
             raise RuntimeError(
                 f"'{cmd}' was not recognised by the sensor (status 0) after "
@@ -484,16 +487,26 @@ class CognexConnection:
               f"({COGNEX_ONLINE_TRIGGER if online else COGNEX_OFFLINE_TRIGGER})")
 
         if not await self.set_online(online):
+            # Not fatal. Native Mode has no "get online" query, so a refused
+            # SO cannot be told apart from the sensor already being in the
+            # state we want -- and In-Sight refuses Set Online outright when
+            # the sensor was put Offline by hand in Explorer or by a Discrete
+            # Input. Warn, record it, and let the trigger be the real test:
+            # it fails loudly and specifically if the state is actually wrong.
             want = "Online" if online else "Offline"
-            raise RuntimeError(
-                f"The Cognex refused to go {want} "
-                f"(SO{1 if online else 0} -> '{self._last_online_reply}'). "
-                f"Cognex documents that Set Online cannot bring the sensor "
-                f"Online if it was set Offline manually in In-Sight Explorer or "
-                f"by a Discrete Input; that latch is only clearable the same "
-                f"way. Set the sensor Online in In-Sight Explorer and retry. "
-                f"Trigger Mode 'offline' avoids needing SO1 at all."
+            self._state_uncertain = (
+                f"SO{1 if online else 0} was refused "
+                f"('{self._last_online_reply}'), so the sensor may not be {want}"
             )
+            print(f"[Cognex] ! Could not set {want}: "
+                  f"SO{1 if online else 0} -> '{self._last_online_reply}'.")
+            print(f"[Cognex]   Continuing -- the sensor may already be {want}. "
+                  f"If it is not, the trigger below will say so.")
+            print(f"[Cognex]   In-Sight refuses Set Online when the sensor was "
+                  f"set Offline by hand in Explorer or by a Discrete Input; "
+                  f"that latch clears only the same way.")
+        else:
+            self._state_uncertain = ""
 
         if not COGNEX_REQUIRE_JOB:
             return None
