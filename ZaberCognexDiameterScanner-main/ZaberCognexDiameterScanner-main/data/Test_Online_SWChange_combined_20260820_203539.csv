@@ -1,0 +1,24 @@
+# Combined Diameter Scan Report
+# Part_ID,Test_Online_SWChange
+# Timestamp,2026-08-20 20:35:39
+# Calibration_File,calibration_Black_05052026-1_20260505_203959.csv
+# B19_Calibrated_Diameter,411.163000
+# F25_Nominal_Mean,3.829825
+# Raw_Diameter,14.008000
+# Raw_RMS_Residual,0.000000
+# Raw_R_Squared,0.00000000
+# Calibrated_Diameter,14.001161
+# Calibrated_RMS_Residual,0.000224
+# Calibrated_R_Squared,0.00000000
+# Recipe,JR_Test Recipe
+# Cognex_Job,DiameterGagingMachine_JR.jobx
+# Nominal,14.000000
+# Tol_Plus,0.125000
+# Tol_Minus,0.125000
+# Result,PASS
+
+Degree,Raw_B21,F25_cal,Offset_Applied,Calibrated_B21
+0.000,7.004000,3.829000,-0.000825,7.003175
+2.000,7.004000,3.827000,-0.002825,7.001175
+4.000,7.004000,3.826000,-0.003825,7.000175
+6.000,7.004000,3.824000,-0.005825,6.998175
