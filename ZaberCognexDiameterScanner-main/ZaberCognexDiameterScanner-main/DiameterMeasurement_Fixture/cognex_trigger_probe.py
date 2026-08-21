@@ -59,22 +59,34 @@ async def read_cell(conn, cell):
         return None
 
 
-async def try_trigger(conn, cmd, cell):
-    """Fire one candidate and report reply + whether the cell moved."""
-    before = await read_cell(conn, cell)
+async def try_trigger(conn, cmd, cell, counter_cell=None):
+    """Fire one candidate and report the reply plus any cell movement.
+
+    `cell` alone is weak evidence: a stationary part re-measures to the same
+    value, so an unchanged cell does NOT mean the trigger did nothing. Pass
+    `counter_cell` -- anything that increments or timestamps on every
+    acquisition -- for actual proof that an acquisition occurred.
+    """
+    watch = [cell] + ([counter_cell] if counter_cell else [])
+    before = [await read_cell(conn, c) for c in watch]
     reply = await collect(conn, cmd)
-    after = await read_cell(conn, cell)
+    after = [await read_cell(conn, c) for c in watch]
 
     status = reply[0] if reply else "(no reply)"
-    changed = (before is not None and after is not None and before != after)
+    moves = [b is not None and a is not None and b != a
+             for b, a in zip(before, after)]
 
-    print(f"  {cmd:<6} reply={reply!s:<20} "
-          f"{cell}: {before} -> {after}"
-          f"{'   <-- CELL CHANGED' if changed else ''}")
-    return {"cmd": cmd, "status": status, "reply": reply, "changed": changed}
+    shown = "  ".join(f"{c}: {b} -> {a}" for c, b, a in zip(watch, before, after))
+    print(f"  {cmd:<6} reply={reply!s:<20} {shown}"
+          f"{'   <-- CHANGED' if any(moves) else ''}")
+    return {
+        "cmd": cmd, "status": status, "reply": reply,
+        "changed": moves[0],
+        "counter_changed": moves[1] if counter_cell else None,
+    }
 
 
-async def main(cell, host):
+async def main(cell, host, counter_cell):
     if host:
         common.COGNEX_HOST = host
 
@@ -93,7 +105,10 @@ async def main(cell, host):
         print("      (a '0' reply just means this firmware has no such command)")
 
         print("\n[2] Sensor Online (SO1)")
-        print(f"  SO1    -> {await collect(conn, 'SO1')}")
+        so1 = await collect(conn, "SO1")
+        online_ok = bool(so1) and so1[0] == "1"
+        print(f"  SO1    -> {so1}"
+              f"{'' if online_ok else '   <-- REFUSED, sensor stays Offline'}")
 
         baseline = await read_cell(conn, cell)
         print(f"  {cell} currently reads: {baseline}")
@@ -102,11 +117,12 @@ async def main(cell, host):
                   f"job is loaded -- trigger results below will be inconclusive.")
 
         print("\n[3] Candidate triggers, sensor ONLINE")
-        online_results = [await try_trigger(conn, c, cell) for c in CANDIDATES]
+        online_results = [await try_trigger(conn, c, cell, counter_cell)
+                          for c in CANDIDATES]
 
         print("\n[4] Baseline: sensor OFFLINE + MT (the known-good path)")
         print(f"  SO0    -> {await collect(conn, 'SO0')}")
-        offline_mt = await try_trigger(conn, "MT", cell)
+        offline_mt = await try_trigger(conn, "MT", cell, counter_cell)
 
         print("\n  Restoring Online...")
         print(f"  SO1    -> {await collect(conn, 'SO1')}")
@@ -118,37 +134,56 @@ async def main(cell, host):
     print("RESULT")
 
     acked = [r for r in online_results if r["status"] == "1"]
-    moved = [r for r in online_results if r["changed"]]
+    if counter_cell:
+        proved = [r for r in online_results if r["counter_changed"]]
+        control_worked = bool(offline_mt["counter_changed"])
+    else:
+        proved = [r for r in online_results if r["changed"]]
+        control_worked = bool(offline_mt["changed"])
 
-    if moved:
-        best = moved[0]["cmd"]
+    if not online_ok:
+        print(f"  The sensor REFUSED to go Online: SO1 -> {so1}.")
+        print("  Fix this first. A soft trigger cannot work while the sensor is")
+        print("  Offline, so every trigger result above was taken in the wrong")
+        print("  state and proves nothing about online triggering.")
+        print("\n  Worth ruling out, in order:")
+        print("   1. In-Sight Explorer / EasyBuilder connected to this sensor?")
+        print("      A connected client owns the Online/Offline state and will")
+        print("      refuse the change from telnet. Close it and re-run.")
+        print("   2. Does the sensor go Online from In-Sight Explorer by hand?")
+        print("      If it refuses there too, this is not a telnet problem.")
+        print("   3. Job errors or a discrete input holding it Offline?")
+    elif proved:
+        best = proved[0]["cmd"]
         print(f"  Online triggering WORKS with: {best}")
         print(f"  Set common.COGNEX_ONLINE_TRIGGER = \"{best}\" (default is "
               f"{common.COGNEX_ONLINE_TRIGGER!r}).")
+    elif not control_worked:
+        print("  INCONCLUSIVE -- the offline MT control did not register either,")
+        print("  so this run cannot tell a dead trigger from a live one.")
+        if not counter_cell:
+            print(f"\n  {cell} is a measurement of a stationary part, so it reads the")
+            print("  same value no matter how many times you trigger. Re-run with a")
+            print("  cell that changes on every acquisition:")
+            print("\n      python cognex_trigger_probe.py --counter-cell <cell>")
+            print("\n  Any counter or timestamp in the job will do. Rotating the part")
+            print("  between triggers works too.")
+        else:
+            print(f"\n  {counter_cell} did not move for any command, including the")
+            print("  known-good offline MT. Check that it really is an acquisition")
+            print("  counter, and that the job is running.")
     elif acked:
         best = acked[0]["cmd"]
-        print(f"  {best} was accepted (status 1) but the cell did not change.")
-        print(f"  The command is valid; the job is most likely not acquiring on "
-              f"it. Check the AcquireImage Trigger setting in the job.")
+        print(f"  {best} was accepted (status 1) but no acquisition registered,")
+        print("  while the offline MT control did. The command is valid and the")
+        print("  job is not acquiring on it -- check the AcquireImage Trigger")
+        print("  setting in the job (Manual or Network; not Continuous/External).")
     else:
         codes = sorted({r["status"] for r in online_results})
         print(f"  No candidate triggered while Online. Status codes seen: {codes}")
-        if offline_mt["changed"]:
-            print("  Offline MT DID work, so the sensor and cell are fine -- the")
-            print("  sensor simply will not soft-trigger in its current setup.")
-            print("  Use Trigger Mode 'offline' until the job/access side is sorted.")
-        else:
-            print("  Offline MT did not work either, so this is not specific to")
-            print("  online mode. Check the cell address and the loaded job first.")
-
-        print("\n  Worth ruling out, in order:")
-        print("   1. Job's AcquireImage Trigger set to Manual or Network?")
-        print("      Continuous and External refuse soft triggers. This is the")
-        print("      leading suspect whenever SO1 above succeeded, since that")
-        print("      proves the session can already change sensor state.")
-        print("   2. In-Sight Explorer / EasyBuilder connected to this sensor?")
-        print("      It holds Full Access and leaves telnet read-only.")
-        print("   3. Telnet user has Full Access rights on the sensor?")
+        print("  Offline MT did register, so the sensor and cell are fine and the")
+        print("  sensor simply will not soft-trigger as configured.")
+        print("  Use Trigger Mode 'offline' until the job side is sorted.")
 
     print("=" * 72 + "\n")
     return 0
@@ -158,5 +193,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cell", default="B21", help="measurement cell to watch (default B21)")
     ap.add_argument("--host", default=None, help="override the Cognex IP")
+    ap.add_argument("--counter-cell", default=None,
+                    help="cell that increments or timestamps on every "
+                         "acquisition; the only sound proof a trigger fired")
     args = ap.parse_args()
-    sys.exit(asyncio.run(main(args.cell, args.host)))
+    sys.exit(asyncio.run(main(args.cell, args.host, args.counter_cell)))

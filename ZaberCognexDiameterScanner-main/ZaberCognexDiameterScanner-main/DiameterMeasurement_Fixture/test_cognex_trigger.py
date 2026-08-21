@@ -210,6 +210,16 @@ async def main():
     check("returns None when gate off", job is None, repr(job))
     common.COGNEX_REQUIRE_JOB = True
 
+    print("\n== a refused SO1 is reported with its status ==")
+    s = FakeSensor(online=False)
+    s.handle = lambda cmd: (s.sent.append(cmd), s.out.append("-5"))[0]
+    try:
+        await make_conn(s).prepare_for_scan()
+        check("SO1 refusal surfaces", False, "no exception")
+    except RuntimeError as e:
+        check("SO1 refusal surfaces", "refused to go Online" in str(e), str(e))
+        check("SO1 refusal quotes the status", "-5" in str(e), str(e))
+
     print("\n== offline mode still works (regression) ==")
     common.COGNEX_TRIGGER_MODE = "offline"
     s = FakeSensor(online=True)
@@ -226,4 +236,5 @@ async def main():
     return 1 if FAIL else 0
 
 
-sys.exit(asyncio.run(main()))
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

@@ -82,6 +82,7 @@ class CognexConnection:
         self.reader = None
         self.writer = None
         self._connected = False
+        self._last_online_reply = ""   # raw reply to the most recent SO0/SO1
 
     async def connect(self):
         if self._connected:
@@ -437,6 +438,7 @@ class CognexConnection:
         for _ in range(retries):
             await self._drain(0.2)
             resp = await self._command(f"SO{want}")
+            self._last_online_reply = resp
             if resp.startswith("1"):
                 print(f"[Cognex] Sensor {label}")
                 return True
@@ -482,9 +484,14 @@ class CognexConnection:
               f"({COGNEX_ONLINE_TRIGGER if online else COGNEX_OFFLINE_TRIGGER})")
 
         if not await self.set_online(online):
+            want = "Online" if online else "Offline"
             raise RuntimeError(
-                f"Could not put the Cognex {'Online' if online else 'Offline'} "
-                f"(SO{1 if online else 0} was not acknowledged)."
+                f"The Cognex refused to go {want} "
+                f"(SO{1 if online else 0} -> '{self._last_online_reply}'). "
+                f"A connected In-Sight Explorer / EasyBuilder session owns the "
+                f"Online state and will block the change -- close it and retry. "
+                f"If the sensor will not go {want} by hand either, this is not "
+                f"a telnet problem. Trigger Mode 'offline' avoids needing SO1."
             )
 
         if not COGNEX_REQUIRE_JOB:
