@@ -50,6 +50,14 @@ COGNEX_TRIGGER_MODE = "online"      # "online" (SO1 + SW8) or "offline" (SO0 + M
 COGNEX_ONLINE_TRIGGER = "SW8"       # soft event used in online mode
 COGNEX_OFFLINE_TRIGGER = "MT"       # manual trigger used in offline mode
 
+# How long to wait for a trigger acknowledgment before giving up (seconds).
+COGNEX_TRIGGER_TIMEOUT_S = 5.0
+
+# Echo every raw line the sensor sends during trigger/read. The Native Mode
+# reply that matters is often a bare status code that the parsers skip, so this
+# is the only way to see what the sensor actually said when a trigger fails.
+COGNEX_LOG_RAW = True
+
 # Refuse to start a scan unless the sensor reports a loaded job. A sensor with
 # no job returns garbage or nothing for the measurement cells, so this turns a
 # confusing mid-scan failure into a clear pre-flight error.
@@ -122,13 +130,24 @@ class CognexConnection:
             await self._trigger_offline()
 
     async def _trigger_online(self):
-        """SW8 soft-event trigger; the sensor stays Online."""
+        """SW8 soft-event trigger; the sensor stays Online.
+
+        Waits up to COGNEX_TRIGGER_TIMEOUT_S for the '1' success status. A
+        non-'1' status does NOT fail the trigger straight away: it can be a
+        stale reply left in the buffer by an earlier command, so it is recorded
+        and the read window stays open in case the real ack follows. Only when
+        the window closes without a '1' does this raise, reporting the last bad
+        status and every line the sensor sent, which is what you need to tell
+        "command not recognised" (0) from "command refused" (-1) apart.
+        """
         t_start = time.time()
         cmd = COGNEX_ONLINE_TRIGGER
         self.writer.write(f"{cmd}\r\n")
         await self.writer.drain()
 
-        deadline = asyncio.get_event_loop().time() + 5.0
+        seen = []
+        bad_status = None
+        deadline = asyncio.get_event_loop().time() + COGNEX_TRIGGER_TIMEOUT_S
         while asyncio.get_event_loop().time() < deadline:
             try:
                 line = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
@@ -137,6 +156,9 @@ class CognexConnection:
             if not line:
                 continue
             txt = line.strip()
+            if COGNEX_LOG_RAW:
+                print(f"      -> [raw] {txt!r}")
+            seen.append(txt)
             if not txt or txt == cmd or txt == '>':
                 continue
             if not self._is_status_code(txt):
@@ -146,13 +168,27 @@ class CognexConnection:
                 print(f"      -> {cmd} ack ({(time.time()-t_start)*1000:.1f}ms)")
                 await asyncio.sleep(0.05)
                 return
-            raise RuntimeError(
-                f"{cmd} trigger rejected (status {txt}). The sensor must be "
-                f"Online with the job's acquisition trigger set to Manual or "
-                f"Network."
-            )
+            bad_status = txt
 
-        raise RuntimeError(f"No acknowledgment for {cmd} trigger within 5s")
+        waited = time.time() - t_start
+        detail = f" Sensor sent: {seen}." if seen else " Sensor sent nothing."
+        if bad_status == "0":
+            raise RuntimeError(
+                f"'{cmd}' was not recognised by the sensor (status 0) after "
+                f"{waited:.1f}s. This firmware may use a different soft-trigger "
+                f"command -- set common.COGNEX_ONLINE_TRIGGER, or switch "
+                f"Trigger Mode to 'offline' to go back to SO0 + MT.{detail}"
+            )
+        if bad_status is not None:
+            raise RuntimeError(
+                f"{cmd} trigger refused (status {bad_status}) after {waited:.1f}s. "
+                f"The sensor must be Online with the job's acquisition trigger "
+                f"set to Manual or Network.{detail}"
+            )
+        raise RuntimeError(
+            f"No acknowledgment for {cmd} within {COGNEX_TRIGGER_TIMEOUT_S:.1f}s."
+            f"{detail}"
+        )
 
     async def _trigger_offline(self):
         """MT manual trigger; requires the sensor to be Offline."""
@@ -185,6 +221,7 @@ class CognexConnection:
     async def read_once(self, cell):
         """Read a cell value once."""
         t_start = time.time()
+        seen = []
         print(f"      -> Reading {cell}...")
 
         self.writer.write(f"GV{cell}\r\n")
@@ -197,6 +234,9 @@ class CognexConnection:
                 if not line:
                     continue
                 txt = line.strip()
+                if COGNEX_LOG_RAW and txt:
+                    print(f"      -> [raw] {txt!r}")
+                    seen.append(txt)
                 if not txt or txt[0] in 'WUPLOGTS>':
                     continue
 
@@ -208,7 +248,8 @@ class CognexConnection:
             except asyncio.TimeoutError:
                 continue
 
-        raise RuntimeError("No value received")
+        detail = f" Sensor sent: {seen}." if seen else " Sensor sent nothing."
+        raise RuntimeError(f"No value received from GV{cell}.{detail}")
 
     async def read_cell(self, cell):
         """Read a stored cell value (no MT trigger). Returns float."""
@@ -216,19 +257,29 @@ class CognexConnection:
         return val
 
     async def trigger_and_read(self, cell):
-        """Trigger and read with retries on failure."""
+        """Trigger and read with retries on failure.
+
+        Reports the underlying error on every attempt and carries the last one
+        into the final exception. A bare "no value received" hides whether the
+        trigger was refused or the cell read came back empty, which are very
+        different faults.
+        """
+        last_error = None
         for attempt in range(1, COGNEX_MAX_RETRIES + 1):
             try:
                 await self.trigger()
                 await asyncio.sleep(0.05)
                 val, read_attempts = await self.read_once(cell)
                 return val, read_attempts, attempt
-            except RuntimeError:
-                print(f"      ! Attempt {attempt}/{COGNEX_MAX_RETRIES} failed -- no value received")
+            except RuntimeError as e:
+                last_error = e
+                print(f"      ! Attempt {attempt}/{COGNEX_MAX_RETRIES} failed: {e}")
                 if attempt < COGNEX_MAX_RETRIES:
                     print(f"      -> Retrying trigger + read...")
                     await asyncio.sleep(0.5)
-        raise RuntimeError(f"No value received after {COGNEX_MAX_RETRIES} attempts")
+        raise RuntimeError(
+            f"Failed after {COGNEX_MAX_RETRIES} attempts. Last error: {last_error}"
+        ) from last_error
 
     async def _command(self, cmd, timeout=5.0):
         """Send a raw Native Mode command and return the first response line.

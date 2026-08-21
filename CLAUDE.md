@@ -69,6 +69,20 @@ before any motion, and the GUI shows them as an error dialog.
 gate; all three scan tabs call it right after connecting. Both are switchable at
 runtime in Edit → Settings… → Cognex IL38 → Triggering.
 
+### Diagnosing trigger failures
+
+`COGNEX_TRIGGER_TIMEOUT_S` (default 5.0) is how long a trigger waits for its
+acknowledgment. A non-`1` status does not fail the trigger straight away — the
+read window stays open in case the real ack follows a stale buffered line — and
+the resulting error names the status: `0` means the sensor did not recognise the
+command (wrong `COGNEX_ONLINE_TRIGGER` for this firmware), `-1` means it refused
+it (usually the job's Acquire trigger is not Manual/Network).
+
+`COGNEX_LOG_RAW` (default on) echoes every raw line the sensor sends during
+trigger and cell reads, since the Native Mode reply that matters is often a bare
+status code the parsers skip. `trigger_and_read()` prints the real error on each
+attempt and chains the last one into its final exception.
+
 Settings can be edited live via the GUI (Edit → Settings…). They get pushed
 into `common.*` module globals via `SettingsManager.apply_to_modules()` right
 before each scan starts.

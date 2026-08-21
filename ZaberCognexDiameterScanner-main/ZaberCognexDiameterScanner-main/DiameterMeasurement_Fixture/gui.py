@@ -86,6 +86,7 @@ class SettingsManager:
         "cognex_retries": "5",
         "diameter_cell": "B21", "calibration_cell": "F25",
         "cognex_trigger_mode": "online", "cognex_require_job": "1",
+        "cognex_trigger_timeout": "5.0",
     }
 
     def __init__(self, root: tk.Tk):
@@ -108,6 +109,8 @@ class SettingsManager:
         self._vars["cognex_trigger_mode"] = tk.StringVar(value=common.COGNEX_TRIGGER_MODE)
         self._vars["cognex_require_job"] = tk.StringVar(
             value="1" if common.COGNEX_REQUIRE_JOB else "0")
+        self._vars["cognex_trigger_timeout"] = tk.StringVar(
+            value=str(common.COGNEX_TRIGGER_TIMEOUT_S))
 
     # -- Public helpers (used by tabs / scan threads) --
 
@@ -132,6 +135,7 @@ class SettingsManager:
         common.COGNEX_MAX_RETRIES = self.get_int("cognex_retries")
         common.COGNEX_TRIGGER_MODE = self.get("cognex_trigger_mode")
         common.COGNEX_REQUIRE_JOB = self.get("cognex_require_job") == "1"
+        common.COGNEX_TRIGGER_TIMEOUT_S = self.get_float("cognex_trigger_timeout")
         DiameterScan.COGNEX_CELL = self.get("diameter_cell")
         CalibrationScan.CALIBRATION_CELL = self.get("calibration_cell")
 
@@ -201,10 +205,11 @@ class SettingsManager:
                  "offline = sensor taken offline, MT manual trigger",
             font=("Segoe UI", 7), foreground="#555", justify=tk.LEFT,
         ).grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        self._dialog_field(cognex_frame, "Trigger Timeout (s)", "cognex_trigger_timeout", 13)
         ttk.Checkbutton(
             cognex_frame, text="Require a loaded job before scanning",
             variable=self._vars["cognex_require_job"], onvalue="1", offvalue="0",
-        ).grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ).grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=2)
 
         # --- Buttons ---
         btn_frame = ttk.Frame(dlg)
