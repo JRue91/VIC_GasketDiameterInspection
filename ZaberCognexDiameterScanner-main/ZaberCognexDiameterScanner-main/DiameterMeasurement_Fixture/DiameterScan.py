@@ -40,6 +40,56 @@ class CircleFitResult:
     max_residual: float
     r_squared: float
 
+    @property
+    def std_dev(self) -> float:
+        """Sigma of the per-point diameter about the fitted circle.
+
+        Each point's diameter error is twice its radial residual, so this is
+        exactly 2 * residual_rms. Sigma of the residuals themselves is
+        identical to residual_rms, which the reports already show -- this is
+        the per-point-diameter figure, deliberately not a duplicate of it.
+
+        A property rather than a field, so a hand-built CircleFitResult can
+        never report a stale 0.0.
+        """
+        return 2.0 * self.residual_rms
+
+
+@dataclass(frozen=True)
+class RunIds:
+    """Per-run traceability IDs that accompany Part ID.
+
+    Report-only: Part_ID alone still drives every filename. All three are
+    optional; blank means "not recorded" and is omitted from the reports
+    rather than rendered as an empty or "None" row.
+
+    Part ID is deliberately NOT held here -- it stays a positional argument to
+    each writer, so a report's table can never disagree with its own filename.
+    """
+    kanban_id: str = ""
+    cycle: str = ""
+    cavity: str = ""
+
+    @classmethod
+    def of(cls, kanban_id=None, cycle=None, cavity=None) -> "RunIds":
+        """Build from possibly-None values; None and whitespace become ''."""
+        return cls(str(kanban_id or "").strip(),
+                   str(cycle or "").strip(),
+                   str(cavity or "").strip())
+
+    def __bool__(self) -> bool:
+        return bool(self.kanban_id or self.cycle or self.cavity)
+
+    def labeled(self) -> list[tuple[str, str]]:
+        """[(label, value)] for the populated fields only, in report order.
+
+        The single place the "blank renders as empty, never None" rule lives,
+        so it cannot drift between report formats.
+        """
+        return [(label, value) for label, value in
+                (("Kanban ID", self.kanban_id), ("Cycle", self.cycle),
+                 ("Cavity", self.cavity)) if value]
+
 
 async def sequencer(axis, conn, step_deg, num_steps, speed, accel, dwell, real_time_plot, stop_event=None):
     """BRUTE FORCE SEQUENCER."""
@@ -209,6 +259,42 @@ def _update_plot(measurements, ax1, ax2):
     plt.pause(0.01)
 
 
+def _circle_fit_r_squared(radii, theta_rad, xc, yc, radius):
+    """R^2 of the fitted circle against the measured radius-vs-angle profile.
+
+    The sensor reads r(theta) from the rotation axis, so the model value at
+    each angle is the distance from the origin to the fitted circle along that
+    ray:
+
+        model_r(t) = xc*cos(t) + yc*sin(t)
+                     + sqrt(R^2 - (xc*sin(t) - yc*cos(t))^2)
+
+        R^2 = 1 - sum((r_i - model_r_i)^2) / sum((r_i - mean(r))^2)
+
+    The previous form compared the residuals against themselves -- numerator
+    and denominator were the same sum -- so it returned exactly 0.0 on every
+    scan ever run (hence the 0.00000000 in every archived report).
+    """
+    perp = xc * np.sin(theta_rad) - yc * np.cos(theta_rad)
+    # A negative radicand means the ray misses the fitted circle entirely,
+    # which can only happen when the rotation axis falls outside it. Clamp to
+    # 0 so the model degenerates to the tangent point instead of going NaN.
+    model_r = (xc * np.cos(theta_rad) + yc * np.sin(theta_rad)
+               + np.sqrt(np.maximum(radius ** 2 - perp ** 2, 0.0)))
+    ss_res = float(np.sum((radii - model_r) ** 2))
+    ss_tot = float(np.sum((radii - radii.mean()) ** 2))
+    if ss_tot <= 0.0:
+        # Every reading identical (it happens -- a 4-point bring-up scan can
+        # return one value four times): no variation left to explain. Perfect
+        # when the model agrees to within float noise, otherwise the fit
+        # explains none of it. Returning 0.0 unconditionally here would be
+        # indistinguishable from the bug this replaced, and an exact ss_res
+        # == 0 test would miss it -- the real file lands at ss_res ~ 8e-31.
+        rms_err = float(np.sqrt(ss_res / len(radii)))
+        return 1.0 if rms_err <= 1e-9 * max(abs(float(radii.mean())), 1.0) else 0.0
+    return 1.0 - ss_res / ss_tot
+
+
 def fit_circle(measurements):
     if len(measurements) < 3:
         raise ValueError("Need 3+ measurements")
@@ -225,17 +311,19 @@ def fit_circle(measurements):
     result = least_squares(lambda p: residuals(p) - residuals(p).mean(), [x.mean(), y.mean()], method='lm')
     xc, yc = result.x
     dists = residuals([xc, yc])
-    diameter = 2 * dists.mean()
-    
-    res = dists - dists.mean()
+    radius = dists.mean()
+    diameter = 2 * radius
+
+    res = dists - radius
     rms = np.sqrt(np.mean(res**2))
     max_res = np.max(np.abs(res))
-    r2 = 1 - np.sum(res**2) / np.sum((dists - dists.mean())**2) if np.sum((dists - dists.mean())**2) > 0 else 0
-    
+    r2 = _circle_fit_r_squared(radii, theta_rad, xc, yc, radius)
+
     return CircleFitResult(xc, yc, diameter, rms, max_res, r2)
 
 
-def save_plot(measurements, fit_result, part_id):
+def save_plot(measurements, fit_result, part_id, run_ids=None):
+    run_ids = run_ids or RunIds()
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     
     existing = list(PLOTS_DIR.glob(f"{part_id}_circle_fit_result_*.png"))
@@ -296,22 +384,30 @@ def save_plot(measurements, fit_result, part_id):
         table_data = [
             ['Measurement', 'Value'],
             ['', ''],
+            ['Part ID', str(part_id)],
+        ]
+        table_data += [[label, value] for label, value in run_ids.labeled()]
+        table_data += [
+            ['', ''],
             ['Number of Points', f'{len(measurements)}'],
             ['Diameter', f'{fit_result.diameter:.4f} inches'],
             ['Radius', f'{fit_result.diameter/2:.4f} inches'],
             ['Center (X, Y)', f'({fit_result.center_x:.4f}, {fit_result.center_y:.4f})'],
             ['', ''],
             ['RMS Residual', f'{fit_result.residual_rms:.4f} inches'],
+            ['Std Dev (2xRMS)', f'{fit_result.std_dev:.4f} inches'],
             ['Max Residual', f'{fit_result.max_residual:.4f} inches'],
             ['RMS Error', f'{100*fit_result.residual_rms/(fit_result.diameter/2):.3f}%'],
             ['R² Coefficient', f'{fit_result.r_squared:.6f}'],
         ]
-        
+
         table = ax3.table(cellText=table_data, cellLoc='left', loc='center',
                          colWidths=[0.5, 0.5])
         table.auto_set_font_size(False)
         table.set_fontsize(10)
-        table.scale(1, 2)
+        # Row count now varies with how many run IDs were supplied (13-16);
+        # the taller row scale overflows the quadrant past 12 rows.
+        table.scale(1, 2 if len(table_data) <= 12 else 1.5)
         
         # Style header row
         for i in range(2):
@@ -346,8 +442,9 @@ def save_plot(measurements, fit_result, part_id):
 
 
 SUMMARY_CSV_HEADER = [
-    'Timestamp', 'Part_ID', 'Num_Measurements', 'Center_X_inches', 'Center_Y_inches',
-    'Diameter_inches', 'Radius_inches', 'RMS_Residual_inches', 'Max_Residual_inches',
+    'Timestamp', 'Part_ID', 'Kanban_ID', 'Cycle', 'Cavity', 'Num_Measurements',
+    'Center_X_inches', 'Center_Y_inches', 'Diameter_inches', 'Radius_inches',
+    'RMS_Residual_inches', 'Std_Dev_Diameter_inches', 'Max_Residual_inches',
     'R_Squared', 'Relative_RMS_Error_percent', 'Recipe', 'Nominal', 'Result',
 ]
 
@@ -376,7 +473,27 @@ def _recipe_metadata_rows(recipe, verdict):
     return rows
 
 
-def save_csv(part_id, measurements, fit_result, recipe=None, verdict=None):
+_RUN_ID_CSV_KEYS = {
+    "Kanban ID": "# Kanban_ID",
+    "Cycle": "# Cycle",
+    "Cavity": "# Cavity",
+}
+
+
+def _run_id_metadata_rows(run_ids):
+    """Return '#'-prefixed metadata rows for the per-run traceability IDs.
+
+    Blank fields are omitted, so reports run without them are byte-for-byte
+    unchanged -- the same contract as _recipe_metadata_rows().
+    """
+    if not run_ids:
+        return []
+    return [[_RUN_ID_CSV_KEYS[label], value] for label, value in run_ids.labeled()]
+
+
+def save_csv(part_id, measurements, fit_result, recipe=None, verdict=None,
+             run_ids=None):
+    run_ids = run_ids or RunIds()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     csvs = sorted(DATA_DIR.glob("diameter_measurements_*.csv"))
@@ -388,7 +505,9 @@ def save_csv(part_id, measurements, fit_result, recipe=None, verdict=None):
             with open(latest, newline='') as f:
                 rows = list(csv.reader(f))
             # Only reuse a rolling file whose header matches the current schema
-            # (older files predate the Recipe/Nominal/Result columns).
+            # (older files predate the Recipe/Nominal/Result columns, and older
+            # ones still predate Kanban_ID/Cycle/Cavity/Std_Dev). A schema
+            # change therefore rolls a new file instead of corrupting an old one.
             if rows and rows[0] == SUMMARY_CSV_HEADER and len(rows) - 1 < MAX_RECORDS_PER_CSV:
                 csv_file = latest
         except:
@@ -404,12 +523,18 @@ def save_csv(part_id, measurements, fit_result, recipe=None, verdict=None):
     nominal = f"{recipe.nominal_diameter:.6f}" if recipe is not None else ''
     result = ('PASS' if verdict.passed else 'FAIL') if verdict is not None else ''
 
+    # The one place blank run IDs are written as empty cells rather than
+    # omitted -- a fixed-width table has no choice. Column count must stay in
+    # lockstep with SUMMARY_CSV_HEADER (18).
     with open(csv_file, 'a', newline='') as f:
         csv.writer(f).writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), part_id, len(measurements),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), part_id,
+            run_ids.kanban_id, run_ids.cycle, run_ids.cavity,
+            len(measurements),
             f"{fit_result.center_x:.6f}", f"{fit_result.center_y:.6f}",
             f"{fit_result.diameter:.6f}", f"{fit_result.diameter/2:.6f}",
-            f"{fit_result.residual_rms:.6f}", f"{fit_result.max_residual:.6f}",
+            f"{fit_result.residual_rms:.6f}", f"{fit_result.std_dev:.6f}",
+            f"{fit_result.max_residual:.6f}",
             f"{fit_result.r_squared:.8f}",
             f"{100*fit_result.residual_rms/(fit_result.diameter/2):.4f}",
             recipe_name, nominal, result,
@@ -444,12 +569,14 @@ def apply_calibration(measurements, cal_data):
 
 def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
                           b19, f25_nominal, cal_data, cal_file_name,
-                          recipe=None, verdict=None):
+                          recipe=None, verdict=None, run_ids=None):
     """Write a combined CSV + PNG report comparing raw and calibrated runs.
 
     Returns (csv_path, png_path). When `recipe`/`verdict` are supplied, the
     recipe criteria and PASS/FAIL result are recorded in the metadata header.
+    `run_ids` adds the per-run traceability IDs alongside Part_ID.
     """
+    run_ids = run_ids or RunIds()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -470,15 +597,19 @@ def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
         w = csv.writer(f)
         w.writerow(['# Combined Diameter Scan Report'])
         w.writerow(['# Part_ID', part_id])
+        for row in _run_id_metadata_rows(run_ids):
+            w.writerow(row)
         w.writerow(['# Timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
         w.writerow(['# Calibration_File', cal_file_name])
         w.writerow(['# B19_Calibrated_Diameter', f"{b19:.6f}"])
         w.writerow(['# F25_Nominal_Mean', f"{f25_nominal:.6f}"])
         w.writerow(['# Raw_Diameter', f"{raw_fit.diameter:.6f}"])
         w.writerow(['# Raw_RMS_Residual', f"{raw_fit.residual_rms:.6f}"])
+        w.writerow(['# Raw_Std_Dev_Diameter', f"{raw_fit.std_dev:.6f}"])
         w.writerow(['# Raw_R_Squared', f"{raw_fit.r_squared:.8f}"])
         w.writerow(['# Calibrated_Diameter', f"{cal_fit.diameter:.6f}"])
         w.writerow(['# Calibrated_RMS_Residual', f"{cal_fit.residual_rms:.6f}"])
+        w.writerow(['# Calibrated_Std_Dev_Diameter', f"{cal_fit.std_dev:.6f}"])
         w.writerow(['# Calibrated_R_Squared', f"{cal_fit.r_squared:.8f}"])
         for row in _recipe_metadata_rows(recipe, verdict):
             w.writerow(row)
@@ -566,6 +697,7 @@ def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
         ['Center X', f'{raw_fit.center_x:.4f}', f'{cal_fit.center_x:.4f}'],
         ['Center Y', f'{raw_fit.center_y:.4f}', f'{cal_fit.center_y:.4f}'],
         ['RMS Residual', f'{raw_fit.residual_rms:.4f}', f'{cal_fit.residual_rms:.4f}'],
+        ['Std Dev (2xRMS)', f'{raw_fit.std_dev:.4f}', f'{cal_fit.std_dev:.4f}'],
         ['Max Residual', f'{raw_fit.max_residual:.4f}', f'{cal_fit.max_residual:.4f}'],
         ['RMS Error %', f'{raw_pct:.3f}', f'{cal_pct:.3f}'],
         ['R^2', f'{raw_fit.r_squared:.6f}', f'{cal_fit.r_squared:.6f}'],
@@ -574,11 +706,18 @@ def save_combined_report(part_id, raw_meas, raw_fit, cal_meas, cal_fit,
         ['F25 nominal', f'{f25_nominal:.4f}', ''],
         ['Cal file', cal_file_name, ''],
     ]
+    if run_ids:
+        # Part ID is already in the ax4 title, so only the extra IDs go here.
+        rows.append(['', '', ''])
+        rows += [[label, value, ''] for label, value in run_ids.labeled()]
     tbl = ax4.table(cellText=rows, cellLoc='center', loc='center',
                     colWidths=[0.34, 0.33, 0.33])
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
-    tbl.scale(1, 1.6)
+    # The table grew by the Std Dev row plus up to four optional ID rows. Hold
+    # the total height to its original budget (14 rows at 1.6) so a tall table
+    # does not run up into the title.
+    tbl.scale(1, min(1.6, 14 * 1.6 / len(rows)))
     for col in range(3):
         tbl[(0, col)].set_facecolor('#4CAF50')
         tbl[(0, col)].set_text_props(weight='bold', color='white')
@@ -615,14 +754,16 @@ def split_into_rotations(measurements, step_deg, num_rotations):
 
 def save_multi_rotation_report(part_id, rotations, fits,
                                 b19=None, f25_nominal=None, cal_file_name=None,
-                                recipe=None, verdict=None):
+                                recipe=None, verdict=None, run_ids=None):
     """Write CSV + PNG comparing N rotations of the same part.
 
     `rotations` is a list of per-rotation MeasurementPoint lists (theta in
     [0, 360)). `fits` is a parallel list of CircleFitResult.
     Optional B19/F25_nominal/cal_file_name are recorded as metadata when
     calibration was applied to the rotations before this call.
+    `run_ids` adds the per-run traceability IDs alongside Part_ID.
     """
+    run_ids = run_ids or RunIds()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -634,6 +775,8 @@ def save_multi_rotation_report(part_id, rotations, fits,
         w = csv.writer(f)
         w.writerow(['# Multi-Rotation Diameter Scan Report'])
         w.writerow(['# Part_ID', part_id])
+        for row in _run_id_metadata_rows(run_ids):
+            w.writerow(row)
         w.writerow(['# Timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
         w.writerow(['# Num_Rotations', n])
         w.writerow(['# Calibration_Applied', 'yes' if cal_applied else 'no'])
@@ -644,6 +787,7 @@ def save_multi_rotation_report(part_id, rotations, fits,
         for i, fit in enumerate(fits, start=1):
             w.writerow([f'# Rotation_{i}_Diameter', f"{fit.diameter:.6f}"])
             w.writerow([f'# Rotation_{i}_RMS_Residual', f"{fit.residual_rms:.6f}"])
+            w.writerow([f'# Rotation_{i}_Std_Dev_Diameter', f"{fit.std_dev:.6f}"])
             w.writerow([f'# Rotation_{i}_Max_Residual', f"{fit.max_residual:.6f}"])
             w.writerow([f'# Rotation_{i}_R_Squared', f"{fit.r_squared:.8f}"])
         diameters = np.array([f.diameter for f in fits])
@@ -743,20 +887,27 @@ def save_multi_rotation_report(part_id, rotations, fits,
     # Quadrant 4: Stats table
     ax4 = plt.subplot(2, 2, 4)
     ax4.axis('off')
-    header = ['Rot', 'Points', 'Diameter', 'RMS Resid', 'Max Resid', 'R^2']
+    # 'Std Dev' is the within-rotation per-point diameter sigma; the aggregate
+    # 'Stdev rot-to-rot' row below is the cross-rotation repeatability. The
+    # two mean different things, so neither label may be shortened to 'Stdev'.
+    header = ['Rot', 'Points', 'Diameter', 'RMS Resid', 'Std Dev', 'Max Resid', 'R^2']
     rows = [header]
     for i, (rot, fit) in enumerate(zip(rotations, fits), start=1):
         rows.append([
             str(i), str(len(rot)),
             f'{fit.diameter:.4f}', f'{fit.residual_rms:.5f}',
+            f'{fit.std_dev:.5f}',
             f'{fit.max_residual:.5f}', f'{fit.r_squared:.5f}',
         ])
     diameters = np.array([f.diameter for f in fits])
     rmss = np.array([f.residual_rms for f in fits])
-    rows.append(['', '', '', '', '', ''])
-    rows.append(['Mean', '', f'{diameters.mean():.4f}', f'{rmss.mean():.5f}', '', ''])
-    rows.append(['Range', '', f'{diameters.max() - diameters.min():.4f}', '', '', ''])
-    rows.append(['Stdev', '', f'{diameters.std():.4f}', '', '', ''])
+    stds = np.array([f.std_dev for f in fits])
+    rows.append(['', '', '', '', '', '', ''])
+    rows.append(['Mean', '', f'{diameters.mean():.4f}', f'{rmss.mean():.5f}',
+                 f'{stds.mean():.5f}', '', ''])
+    rows.append(['Range (dia)', '', f'{diameters.max() - diameters.min():.4f}',
+                 '', '', '', ''])
+    rows.append(['Stdev rot-to-rot', '', f'{diameters.std():.4f}', '', '', '', ''])
 
     tbl = ax4.table(cellText=rows[1:], colLabels=rows[0], loc='center', cellLoc='center')
     tbl.auto_set_font_size(False)
@@ -766,6 +917,11 @@ def save_multi_rotation_report(part_id, rotations, fits,
         tbl[(0, col)].set_facecolor('#4CAF50')
         tbl[(0, col)].set_text_props(weight='bold', color='white')
     title = f'Summary - Part {part_id}{cal_tag}'
+    if run_ids:
+        # The table is already 7 columns wide, so the IDs go in the title
+        # rather than as rows with six empty cells each.
+        title += '\n' + ', '.join(f'{label}: {value}'
+                                  for label, value in run_ids.labeled())
     if cal_applied:
         title += f'\nB19={b19:.4f}, F25_nom={f25_nominal:.4f}, cal={cal_file_name}'
     ax4.set_title(title, fontsize=11, fontweight='bold', pad=20)
@@ -787,6 +943,7 @@ def print_results(part_id, measurements, fit_result):
     print(f"Radius:       {fit_result.diameter/2:.4f} inches")
     print(f"Center (X,Y): ({fit_result.center_x:.4f}, {fit_result.center_y:.4f})")
     print(f"RMS Residual: {fit_result.residual_rms:.4f} inches")
+    print(f"Std Dev:      {fit_result.std_dev:.4f} inches (per-point diameter)")
     print(f"RMS Error:    {100*fit_result.residual_rms/(fit_result.diameter/2):.3f}%")
     print(f"R²:           {fit_result.r_squared:.6f}")
     print("="*60)
@@ -805,7 +962,14 @@ def main():
         part_id = input("\nPart ID: ").strip()
         if part_id:
             break
-    
+
+    # Optional traceability IDs -- blank is accepted and omitted from reports.
+    run_ids = RunIds.of(
+        input("Kanban ID [optional]: "),
+        input("Cycle [optional]: "),
+        input("Cavity [optional]: "),
+    )
+
     step_input = input(f"Step size [default: {INDEX_STEP_DEG}]: ").strip()
     step_deg = float(step_input) if step_input else INDEX_STEP_DEG
     
@@ -839,12 +1003,12 @@ def main():
     
     try:
         fit = fit_circle(measurements)
-        save_csv(part_id, measurements, fit)
+        save_csv(part_id, measurements, fit, run_ids=run_ids)
         print_results(part_id, measurements, fit)
-        save_plot(measurements, fit, part_id)
+        save_plot(measurements, fit, part_id, run_ids=run_ids)
     except Exception as e:
         print(f"ERROR: {e}")
-        save_plot(measurements, None, part_id)
+        save_plot(measurements, None, part_id, run_ids=run_ids)
     
     print("\n[Complete]\n")
 

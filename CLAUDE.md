@@ -15,6 +15,9 @@ diameter and surface profile.
     a multi-run report (PNG + CSV)
   - `test_cognex_trigger.py` — hardware-free checks of the trigger modes and
     the job gate, against a stub In-Sight responder (`python test_cognex_trigger.py`)
+  - `sample_report.py` — offline sample-report generator: synthesizes scan data
+    and runs it through the real report writers, no hardware needed
+    (`python sample_report.py`)
 - `ZaberCognexDiameterScanner-main/ZaberCognexDiameterScanner-main/calibration/` — calibration CSVs and `plots/` for verify reports
 - `ZaberCognexDiameterScanner-main/ZaberCognexDiameterScanner-main/data/` — diameter scan CSVs
 - `ZaberCognexDiameterScanner-main/ZaberCognexDiameterScanner-main/plots/` — diameter scan plots
@@ -136,7 +139,8 @@ before each scan starts.
 All output files are timestamped (`YYYYMMDD_HHMMSS`) so re-runs never overwrite
 prior results:
 
-- Diameter scan (raw, 1 rotation): `<part_id>_<timestamp>.csv` and `<part_id>_circle_fit_result_<timestamp>.png`
+- Diameter scan (raw, 1 rotation): a row appended to the rolling
+  `diameter_measurements_<timestamp>.csv` and `<part_id>_circle_fit_result_<N>.png`
 - Diameter scan (with **Apply Calibration** checked, 1 rotation): `<part_id>_combined_<timestamp>.{csv,png}`
   — single combined report with raw + calibrated circle fits side-by-side, the
   per-angle offset curve, and a stats table. Offset applied per measurement is
@@ -157,6 +161,93 @@ prior results:
 The verify report consolidates N runs (set by the **Number of Runs** field in
 the GUI) into one PNG (overlay plot, error plot, combined histogram, summary
 table) plus one row-per-measurement CSV.
+
+### Traceability IDs
+
+The Diameter Scan tab carries three optional per-run fields beside Part ID —
+**Kanban ID**, **Cycle**, **Cavity** — modelled by `DiameterScan.RunIds` and
+passed to every diameter writer as `run_ids=`. They are **report-only**: Part ID
+alone still drives every filename, which is why `RunIds` deliberately does not
+hold it (a report's table can then never disagree with its own filename).
+
+Blank means "not recorded" and is *omitted* rather than rendered as an empty or
+`None` row — `RunIds.labeled()` is the single place that rule lives, so it
+cannot drift between formats. The one exception is the rolling summary CSV,
+where a fixed-width table forces blanks to be written as empty cells.
+
+They are per-*run*, not per-product, so `apply_recipe()` must never touch them —
+a recipe selection clearing them mid-shift would be a data-integrity bug.
+
+### Statistics
+
+All three diameter reports show RMS residual, standard deviation, and R².
+
+- **Std dev** is σ of the per-point *diameter* about the fitted circle, exposed
+  as `CircleFitResult.std_dev` (a property, so a hand-built result can never
+  report a stale 0.0). It equals exactly `2 × residual_rms`. σ of the residuals
+  themselves is mathematically identical to the RMS residual, so it is
+  deliberately *not* reported as a separate figure.
+- The multi-rotation report distinguishes two different σ: the per-rotation
+  **`Std Dev`** column (within-rotation form error) and the aggregate
+  **`Stdev rot-to-rot`** row (cross-rotation repeatability). Neither label may
+  be shortened to a bare "Stdev".
+- **R²** scores the circle model against the measured radius-vs-angle profile
+  (`_circle_fit_r_squared()`). The previous formula compared the residuals
+  against themselves — numerator and denominator were the same sum — so it
+  returned exactly 0.0 on every scan, which is why every archived report reads
+  `0.00000000`. Negative values are meaningful (a fit worse than the flat mean)
+  and are deliberately not clamped. Zero-variance input (every reading
+  identical, which real 4-point bring-up scans produce) returns 1.0, not NaN.
+
+Adding a column to `SUMMARY_CSV_HEADER` is safe: `save_csv` reuses a rolling
+file only when its header matches exactly, so a schema change rolls a new file
+instead of corrupting an old one. The header list and the `writerow` beneath it
+must stay in lockstep — nothing validates that.
+
+## Offline report development
+
+`sample_report.py` generates every report type from synthetic data so report
+formatting can be edited with the Zaber stage and the Cognex sensor
+disconnected. It builds fake `MeasurementPoint` lists and calls the *real*
+writers (`save_csv`/`save_plot`, `save_combined_report`,
+`save_multi_rotation_report`, `save_calibration`, `save_multi_run_report`,
+`save_comparison_plot`), so what it produces is what a live scan produces —
+same functions, same filenames, same columns.
+
+```powershell
+python sample_report.py                          # all six report types
+python sample_report.py --report combined --open # one report, open the PNG
+python sample_report.py --outcome fail           # force a FAIL verdict
+python sample_report.py --no-recipe              # no-recipe report layout
+python sample_report.py --kanban-id "" --cycle "" --cavity ""   # blank-ID layout
+```
+
+`--kanban-id` / `--cycle` / `--cavity` default to non-blank values so a bare run
+exercises the traceability rows; passing `""` is the explicit blank-path test.
+
+Output goes to `../sample_reports` (git-ignored, overridable with `--outdir`),
+never to the production `../data`, `../plots` or `../calibration` folders — the
+writers read their destinations from module globals, which
+`redirect_outputs()` rebinds.
+
+Report kinds: `raw`, `combined`, `multirotation`, `calibration`, `verify`
+(the GUI's multi-run report) and `verify_single`, the single-run
+`verify_<cal_id>_<timestamp>.png` from `CalibrationVerify.save_comparison_plot`.
+That last writer is **dead on the hardware paths** — `gui.py` imports it but
+never calls it, and `CalibrationVerify.main()` goes straight to the multi-run
+report, so the `verify_*.png` files in `../calibration/plots` are historical.
+The sample generator is its only remaining caller.
+`--cal-step` is an int because the GUI parses that field with `int()`
+and `load_calibration()` reads it back with `int()` — a `StepSize,1.0` header
+is unloadable.
+
+The synthetic part has eccentricity, n-lobe out-of-roundness and sensor noise,
+and the fixture adds runout that the fake F25 calibration captures:
+`raw(θ) = true_radius(θ) − runout(θ) + noise`. Because that is the inverse of
+what `apply_calibration()` does, calibrated fits come out tighter than raw ones
+the way they do on the rig. `--seed` makes a run reproducible; `--nominal`,
+`--noise`, `--step`, `--rotations` and `--runs` size the data set. Recipes are
+built in memory and never written to `../recipes`.
 
 ## Dependencies
 

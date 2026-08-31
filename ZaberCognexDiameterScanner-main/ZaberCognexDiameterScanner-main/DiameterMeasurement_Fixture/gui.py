@@ -731,10 +731,18 @@ class DiameterScanTab(ttk.Frame):
         form.pack(fill=tk.X, padx=8, pady=8)
 
         self.part_id_var = tk.StringVar()
+        # Per-run traceability IDs, recorded alongside Part ID. Optional, and
+        # deliberately not part of the recipe -- see apply_recipe().
+        self.kanban_id_var = tk.StringVar()
+        self.cycle_var = tk.StringVar()
+        self.cavity_var = tk.StringVar()
         self.step_var = tk.StringVar(value="5")
         self.rotations_var = tk.StringVar(value="1")
 
         self._add_field(form, "Part ID *", self.part_id_var)
+        self._add_field(form, "Kanban ID", self.kanban_id_var)
+        self._add_field(form, "Cycle", self.cycle_var)
+        self._add_field(form, "Cavity", self.cavity_var)
         self._add_field(form, "Step Size (deg)", self.step_var)
         self._add_field(form, "Rotations", self.rotations_var)
 
@@ -810,17 +818,29 @@ class DiameterScanTab(ttk.Frame):
                 return
             cal_file = self._cal_files[idx]
 
+        # Free text, all optional: blank means "not recorded" and is omitted
+        # from the reports. RunIds.of() strips and coerces None to "".
+        run_ids = DiameterScan.RunIds.of(
+            self.kanban_id_var.get(),
+            self.cycle_var.get(),
+            self.cavity_var.get(),
+        )
+
         speed = self.app.settings.get_float("speed")
         accel = self.app.settings.get_float("accel")
         dwell = self.app.settings.get_float("dwell")
 
+        # start_scan calls target(*args) positionally -- this tuple and the
+        # _run_thread signature below must stay index-aligned.
         self.app.start_scan(
             "Diameter Scan",
             self._run_thread,
-            (part_id, step_deg, num_rotations, speed, accel, dwell, cal_file, self._active_recipe),
+            (part_id, step_deg, num_rotations, speed, accel, dwell, cal_file,
+             self._active_recipe, run_ids),
         )
 
-    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell, cal_file, recipe=None):
+    def _run_thread(self, part_id, step_deg, num_rotations, speed, accel, dwell,
+                    cal_file, recipe=None, run_ids=None):
         self.app.settings.apply_to_modules()
         if recipe is not None and recipe.diameter_cell:
             DiameterScan.COGNEX_CELL = recipe.diameter_cell
@@ -902,7 +922,7 @@ class DiameterScanTab(ttk.Frame):
                 b19=b19 if cal_data is not None else None,
                 f25_nominal=f25_nominal,
                 cal_file_name=cal_file.name if cal_file is not None else None,
-                recipe=recipe, verdict=verdict,
+                recipe=recipe, verdict=verdict, run_ids=run_ids,
             )
             self.app._result_queue.put(("complete", {"plot_path": png_path, "verdict": verdict}))
             return
@@ -912,9 +932,10 @@ class DiameterScanTab(ttk.Frame):
 
         if cal_data is None:
             verdict = self._evaluate(recipe, fit)
-            save_csv(part_id, measurements, fit, recipe=recipe, verdict=verdict)
+            save_csv(part_id, measurements, fit, recipe=recipe, verdict=verdict,
+                     run_ids=run_ids)
             print_results(part_id, measurements, fit)
-            save_plot(measurements, fit, part_id)
+            save_plot(measurements, fit, part_id, run_ids=run_ids)
             plot_files = sorted(DiameterScan.PLOTS_DIR.glob(f"{part_id}_circle_fit_result_*.png"))
             plot_path = plot_files[-1] if plot_files else None
             self.app._result_queue.put(("complete", {"plot_path": plot_path, "verdict": verdict}))
@@ -930,7 +951,7 @@ class DiameterScanTab(ttk.Frame):
         _csv_path, png_path = save_combined_report(
             part_id, measurements, fit, cal_meas, cal_fit,
             b19, f25_nominal, cal_data, cal_file.name,
-            recipe=recipe, verdict=verdict,
+            recipe=recipe, verdict=verdict, run_ids=run_ids,
         )
 
         self.app._result_queue.put(("complete", {"plot_path": png_path, "verdict": verdict}))
